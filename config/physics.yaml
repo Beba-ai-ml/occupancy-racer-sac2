@@ -1,0 +1,15 @@
+vehicle:
+  acceleration: 2.0
+  brake_deceleration: 3.5
+  reverse_acceleration: 1.5
+  max_speed: 8.0
+  max_reverse_speed: 0.5
+  friction: 0.6
+  drag: 0.2
+  max_steer_angle_deg: 20.0
+  size_m:
+    length: 0.45
+    width: 0.30
+map:
+  surface_friction: 1.0
+  surface_drag: 0.0

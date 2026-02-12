@@ -1,0 +1,120 @@
+map:
+  path: assets/maps/K_02.pgm
+display:
+  scale: 1
+  fps: 60
+  zoom:
+    min: 0.5
+    max: 3.0
+    step: 0.1
+window:
+  caption: Occupancy Racer
+  max_width: 1200
+  max_height: 900
+control:
+  mode: human
+rl:
+  gamma: 0.99
+  tau: 0.005
+  policy_lr: 0.0003
+  q_lr: 0.0003
+  alpha_lr: 0.0003
+  init_alpha: 0.2
+  target_entropy: auto
+  batch_size: 256
+  memory_size: 100000
+  start_steps: 0
+  learn_after: 1000
+  update_every: 1
+  updates_per_step: 1
+  accel_bins: [0.0, 1.0, 2.0]
+  hidden_sizes: [128, 128]
+  device: auto
+  save_dir: runs
+  save_every: 25
+  session_id: default
+  load_from:
+  stack_frames: 1
+train:
+  num_envs: 4
+  render_every: 0
+  fps: 60
+  max_episodes: 0
+async:
+  num_actors: 4
+  sync_every: 1000
+  queue_size: 5000
+  render_actor:
+  render_every: 0
+sim_randomization:
+  enabled: true
+  physics:
+    enabled: true
+    accel_scale: [0.8, 1.2]
+    brake_scale: [0.8, 1.2]
+    reverse_scale: [0.8, 1.2]
+    max_speed_scale: [0.9, 1.1]
+    max_reverse_speed_scale: [0.8, 1.2]
+    friction_scale: [0.8, 1.2]
+    drag_scale: [0.7, 1.3]
+    wheelbase_scale: [0.9, 1.1]
+    max_steer_scale: [0.8, 1.0]
+  surface:
+    enabled: true
+    friction_scale: [0.7, 1.3]
+    drag_range: [0.0, 0.05]
+  observation_noise:
+    enabled: true
+    lidar_noise_std: 0.02
+    lidar_dropout_prob: 0.01
+    lidar_spike_prob: 0.01
+    speed_noise_std: 0.02
+    servo_noise_std: 0.02
+  control:
+    enabled: true
+    delay_steps: [1, 3]
+    steer_rate_limit: 0.15
+    accel_rate_limit: 0.4
+  dt_jitter:
+    enabled: true
+    dt_scale_range: [0.9, 1.1]
+  action_noise:
+    enabled: true
+    steer_scale_range: [0.9, 1.1]
+    steer_bias_range: [-0.05, 0.05]
+    accel_scale_range: [0.9, 1.1]
+    accel_bias_range: [-0.2, 0.2]
+  perturb:
+    enabled: true
+    prob: 0.02
+    yaw_rate_sigma_deg: 1.0
+    speed_sigma: 0.1
+  observation_delay:
+    enabled: true
+    p1: 0.1
+    p2: 0.02
+  action_repeat:
+    steps: 1
+  obstacles:
+    enabled: false
+    episode_prob: 0.6
+    start_episode: 0
+    max_static: 2
+    max_total: 3
+    static_size_range: [0.5, 1.0]
+    static_persist_prob: 0.4
+    static_min_distance: 4.0
+    static_spawn_attempts: 50
+    min_gap: 1.5
+    min_wall_clearance: 0.2
+    min_separation: 1.0
+    pass_buffer: 0.5
+    pass_activate_distance: 8.0
+    dynamic:
+      enabled: true
+      spawn_rate: 0.25
+      distance_range: [3.0, 8.0]
+      size_range: [0.4, 0.8]
+      lateral_range: [-2.0, 2.0]
+      ttl_range: [0.0, 0.0]
+      spawn_attempts: 20

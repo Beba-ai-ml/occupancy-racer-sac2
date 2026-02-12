@@ -1,0 +1,115 @@
+config: config/game.yaml  # Path to the main game config YAML.
+physics: config/physics.yaml  # Path to the physics config YAML.
+map: K_01  # Initial map before rotation.
+map_pool: [K_01, K_02, K_03, K_04, K_05, K_06, K_07, K_08, K_09, K_10]  # 10 maps like best run.
+map_switch_start_episode: 1200  # Start map rotation after N episodes.
+map_switch_every: 10  # Keep a chosen map for N episodes before re-sampling.
+track_center: free  # Center used for track direction (map/free centroid).
+track_direction: clockwise  # Preferred travel direction for alignment reward.
+spawn_face_forward: true  # Flip spawn heading if backward has more clearance.
+num_actors: 64  # Number of actor processes to run in parallel.
+fps: 60  # Simulated frames per second for the environment.
+sync_every: 12800  # Sync actor weights every N transitions (proven in best run).
+queue_size: 96000  # Max number of transitions buffered in the async queue.
+save_every: 250  # Checkpoint every N episodes.
+session_id: SAC_P_12  # Session id used in checkpoint/log filenames.
+save_dir: runs  # Directory for checkpoints and logs.
+load_from: null  # Optional checkpoint to load from; use null to auto-resume.
+no_resume: false  # Disable auto-resume when true.
+max_episodes: 0  # Stop after N episodes; 0 means unlimited.
+episode_time_limit_s: 60  # End episode after N seconds; 0 disables.
+device: cuda  # Device to use for training (cpu/cuda/auto).
+stack_frames: 8  # Compromise between 4 (broken) and 16 (best run).
+gamma: 0.99  # Discount factor for future rewards.
+tau: 0.005  # Target network smoothing coefficient.
+policy_lr: 0.0003  # Actor learning rate.
+q_lr: 0.0003  # Critic learning rate (proven in best run).
+alpha_lr: 0.0003  # Entropy learning rate.
+init_alpha: 0.2  # Initial entropy coefficient.
+target_entropy: auto  # Target entropy; use "auto" to infer from action space.
+batch_size: 256  # Batch size for updates (proven in best run, vs 1024 in broken config).
+memory_size: 1600000  # Replay buffer size.
+start_steps: 0  # Random action steps before using the policy.
+learn_after: 40000  # Start learning after N steps (proven in best run).
+update_every: 1  # Update frequency in steps.
+updates_per_step: 1  # Gradient updates per update step.
+hidden_sizes: [256, 256, 128]  # Hidden layer sizes for policy and critics.
+grad_clip: 1.0  # Gradient norm clipping to prevent Q-gradient explosions.
+alpha_min: 0.01  # Minimum alpha floor (prevents alpha collapse).
+utd_ratio: 0.25  # Update-to-data ratio: 512 drained × 0.25 = ~128 learn() calls/cycle.
+render_actor: 0  # Actor id to render (optional).
+render_every: 0  # Render every N episodes for the render actor; 0 disables.
+reward_scale: 0.8  # Scale applied to the final reward value.
+reward_clip: 20  # Clip absolute reward value; use 0 or null to disable.
+reward_collision_penalty: -20  # Reward value returned on collision.
+reward_alignment_bonus: 0.02  # Bonus for aligning with the clockwise track direction.
+reward_forward_speed_weight: 0.6  # Weight on forward speed in the reward.
+reward_front_speed_weight: 0.2  # Weight on front clearance at speed in the reward.
+reward_front_penalty: 0.06  # Penalty for low front clearance at speed.
+reward_side_penalty: 0.02  # Penalty for low average side clearance.
+reward_min_clear_penalty: 0.04  # Penalty for low minimum clearance.
+reward_balance_penalty: 0.015  # Penalty for left/right clearance imbalance.
+reward_reverse_penalty: 0.03  # Penalty for reverse speed.
+reward_front_cone_deg: 20  # Half-angle (deg) used for the front clearance cone.
+dr_enable: true  # Enable domain randomization.
+dr_physics: true  # Enable physics randomization.
+dr_accel_scale_range: [0.7, 1.3]  # Acceleration scale range.
+dr_brake_scale_range: [0.7, 1.3]  # Brake deceleration scale range.
+dr_reverse_scale_range: [0.7, 1.3]  # Reverse acceleration scale range.
+dr_max_speed_scale_range: [0.85, 1.15]  # Max speed scale range.
+dr_max_reverse_speed_scale_range: [0.7, 1.3]  # Max reverse speed scale range.
+dr_friction_scale_range: [0.7, 1.3]  # Friction scale range.
+dr_drag_scale_range: [0.6, 1.4]  # Drag scale range.
+dr_wheelbase_scale_range: [0.85, 1.15]  # Wheelbase scale range.
+dr_max_steer_scale_range: [0.7, 1.0]  # Max steer scale range.
+dr_surface: true  # Enable surface randomization.
+dr_surface_friction_scale_range: [0.6, 1.4]  # Surface friction scale range.
+dr_surface_drag_range: [0.0, 0.08]  # Surface drag range.
+dr_obs_noise: true  # Enable observation noise.
+dr_lidar_noise_std: 0.03  # Lidar noise standard deviation (normalized).
+dr_lidar_drop_prob: 0.02  # Lidar dropout probability.
+dr_lidar_spike_prob: 0.02  # Lidar spike probability.
+dr_speed_noise_std: 0.03  # Speed noise standard deviation (normalized).
+dr_servo_noise_std: 0.03  # Servo noise standard deviation (normalized).
+dr_control: true  # Enable control delay and rate limits.
+dr_delay_steps: [1, 3]  # Control delay steps as [min, max].
+dr_steer_rate_limit: 0.1  # Steer rate limit per step.
+dr_accel_rate_limit: 0.3  # Accel rate limit per step.
+dr_dt_jitter: true  # Enable time-step jitter.
+dr_dt_scale_range: [0.85, 1.15]  # Time-step scale range.
+dr_action_noise: true  # Enable action noise.
+dr_action_steer_scale_range: [0.85, 1.15]  # Action steer scale range.
+dr_action_steer_bias_range: [-0.08, 0.08]  # Action steer bias range.
+dr_action_accel_scale_range: [0.85, 1.15]  # Action accel scale range.
+dr_action_accel_bias_range: [-0.3, 0.3]  # Action accel bias range.
+dr_perturb: true  # Enable random perturbations.
+dr_perturb_prob: 0.04  # Perturbation probability per step.
+dr_perturb_yaw_rate_sigma_deg: 1.5  # Yaw rate perturbation sigma in degrees per second.
+dr_perturb_speed_sigma: 0.15  # Speed perturbation sigma in meters per second.
+dr_obs_delay: true  # Enable observation delay.
+dr_obs_delay_p1: 0.15  # Observation delay probability for t-1.
+dr_obs_delay_p2: 0.03  # Observation delay probability for t-2.
+action_repeat: 1  # Repeat each action N steps.
+obst_enable: true  # Enable obstacles.
+obst_episode_prob: 0.3  # Probability that an episode has obstacles.
+obst_start_episode: 2400  # Start adding obstacles after N episodes.
+obst_max_static: 1  # Max static obstacles per episode.
+obst_max_total: 3  # Max total obstacles active.
+obst_static_size_range: [0.5, 1.0]  # Static obstacle size range (m).
+obst_static_persist_prob: 0.4  # Static obstacle persistence probability.
+obst_static_min_distance: 4.0  # Minimum distance from spawn to static obstacles (m).
+obst_static_spawn_attempts: 50  # Static obstacle spawn attempts.
+obst_min_gap: 1.5  # Minimum passable gap (m).
+obst_min_wall_clearance: 0.2  # Minimum clearance from walls (m).
+obst_allow_wall_overlap: true  # Allow obstacles to overlap wall pixels.
+obst_min_separation: 1.0  # Minimum separation between obstacles (m).
+obst_pass_buffer: 0.5  # Pass buffer distance (m).
+obst_pass_activate_distance: 8.0  # Distance to activate pass tracking (m).
+obst_dynamic: true  # Enable dynamic obstacles.
+obst_dynamic_spawn_rate: 0.25  # Dynamic obstacle spawn rate (per second).
+obst_dynamic_distance_range: [6.0, 10.0]  # Dynamic obstacle spawn distance range (m).
+obst_dynamic_size_range: [0.4, 0.8]  # Dynamic obstacle size range (m).
+obst_dynamic_lateral_range: [-2.0, 2.0]  # Dynamic obstacle lateral offset range (m).
+obst_dynamic_ttl_range: [0.0, 0.0]  # Dynamic obstacle time-to-live range (s).
+obst_dynamic_max: 2  # Max dynamic obstacles active at once.
+obst_dynamic_spawn_attempts: 20  # Dynamic obstacle spawn attempts.
