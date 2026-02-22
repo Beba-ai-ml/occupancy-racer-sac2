@@ -36,6 +36,12 @@ class Vehicle:
         pixels_per_meter: float,
         angle: float = 0.0,
         render_enabled: bool = True,
+        servo_tau: float = 0.050,
+        motor_tau: float = 0.100,
+        slip_speed_threshold: float = 4.0,
+        min_grip_factor: float = 0.4,
+        grip_reduction_rate: float = 0.3,
+        yaw_inertia_tau: float = 0.100,
     ) -> None:
         self.params = params
         self.position = pygame.Vector2(position)
@@ -46,6 +52,21 @@ class Vehicle:
         self._base_texture = self._create_texture() if render_enabled else None
         self._scaled_texture = None
         self._scaled_for = None
+
+        # S1: Actuator lag — first-order filters
+        self.servo_tau = servo_tau
+        self.motor_tau = motor_tau
+        self.servo_actual = 0.0
+        self.accel_actual = 0.0
+
+        # S4: Tire slip model
+        self.slip_speed_threshold = slip_speed_threshold
+        self.min_grip_factor = min_grip_factor
+        self.grip_reduction_rate = grip_reduction_rate
+
+        # S11: Yaw inertia low-pass filter
+        self.yaw_inertia_tau = yaw_inertia_tau
+        self.yaw_rate = 0.0
 
     def _create_texture(self) -> pygame.Surface:
         length = max(2, int(round(self.params.length * self.ppm)))
@@ -189,6 +210,24 @@ class Vehicle:
         accel_cmd: float | None = None,
     ) -> None:
         params = self.params
+
+        # --- Compute target steer angle from input ---
+        max_steer_angle = params.max_steer_angle
+        min_steer_angle = math.radians(5.0)
+        if max_steer_angle < min_steer_angle:
+            min_steer_angle = max_steer_angle
+        if params.max_speed > 0:
+            speed_ratio = min(abs(self.speed) / params.max_speed, 1.0)
+        else:
+            speed_ratio = 0.0
+        steer_limit = max_steer_angle + (min_steer_angle - max_steer_angle) * speed_ratio
+        steer_target = steer * steer_limit
+
+        # S1: Servo first-order lag filter
+        alpha_servo = min(dt / self.servo_tau, 1.0)
+        self.servo_actual += (steer_target - self.servo_actual) * alpha_servo
+
+        # --- Compute target acceleration ---
         accel = 0.0
         if accel_cmd is None:
             if throttle and not brake:
@@ -201,39 +240,45 @@ class Vehicle:
         else:
             accel = float(accel_cmd)
 
-        if accel == 0.0:
+        # S1: Motor first-order lag filter
+        alpha_motor = min(dt / self.motor_tau, 1.0)
+        self.accel_actual += (accel - self.accel_actual) * alpha_motor
+
+        # --- Apply filtered acceleration ---
+        if self.accel_actual == 0.0:
             friction = params.friction * map_params.surface_friction
             drag = params.drag + map_params.surface_drag
-            decel = friction + drag * abs(self.speed)
+            # S5: Quadratic drag (v² instead of v)
+            decel = friction + drag * self.speed * self.speed
             if decel > 0.0 and self.speed != 0.0:
                 sign = 1.0 if self.speed > 0 else -1.0
                 self.speed -= sign * decel * dt
                 if self.speed * sign < 0:
                     self.speed = 0.0
         else:
-            self.speed += accel * dt
+            self.speed += self.accel_actual * dt
 
         if self.speed > params.max_speed:
             self.speed = params.max_speed
         elif self.speed < -params.max_reverse_speed:
             self.speed = -params.max_reverse_speed
 
-        if steer != 0.0 and abs(self.speed) > 0.05 and params.wheelbase > 0:
-            max_steer_angle = params.max_steer_angle
-            min_steer_angle = math.radians(5.0)
-            if max_steer_angle < min_steer_angle:
-                min_steer_angle = max_steer_angle
+        # --- Steering / yaw rate ---
+        if abs(self.speed) > 0.05 and params.wheelbase > 0:
+            target_yaw_rate = (self.speed / params.wheelbase) * math.tan(self.servo_actual)
 
-            if params.max_speed > 0:
-                speed_ratio = min(abs(self.speed) / params.max_speed, 1.0)
-            else:
-                speed_ratio = 0.0
+            # S4: Tire slip — reduce grip at high speed on smooth floor
+            if abs(self.speed) > self.slip_speed_threshold:
+                speed_excess = (abs(self.speed) - self.slip_speed_threshold) / self.slip_speed_threshold
+                grip = max(self.min_grip_factor, 1.0 - speed_excess * self.grip_reduction_rate)
+                target_yaw_rate *= grip
+        else:
+            target_yaw_rate = 0.0
 
-            steer_limit = max_steer_angle + (min_steer_angle - max_steer_angle) * speed_ratio
-            steer_angle = steer * steer_limit
-            if abs(steer_angle) > 1e-4:
-                yaw_rate = (self.speed / params.wheelbase) * math.tan(steer_angle)
-                self.angle += yaw_rate * dt
+        # S11: Yaw inertia low-pass filter
+        alpha_yaw = min(dt / self.yaw_inertia_tau, 1.0)
+        self.yaw_rate += (target_yaw_rate - self.yaw_rate) * alpha_yaw
+        self.angle += self.yaw_rate * dt
 
         direction = pygame.Vector2(math.cos(self.angle), math.sin(self.angle))
         self.position += direction * self.speed * dt

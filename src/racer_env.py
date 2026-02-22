@@ -141,6 +141,7 @@ class RacerEnv:
         self.reward_balance_penalty = 0.03
         self.reward_reverse_penalty = 0.05
         self.reward_alignment_bonus = 0.02
+        self.reward_distance_progress_weight = 0.1  # S9: forward progress reward
         self.reward_forward_speed_weight = 0.6
         self.reward_front_speed_weight = 0.2
         self.reward_front_cone_deg = float(LIDAR_FRONT_CONE_DEG)
@@ -268,6 +269,8 @@ class RacerEnv:
             self.reward_reverse_penalty = float(reward_cfg["reverse_penalty"])
         if "alignment_bonus" in reward_cfg:
             self.reward_alignment_bonus = float(reward_cfg["alignment_bonus"])
+        if "distance_progress_weight" in reward_cfg:
+            self.reward_distance_progress_weight = float(reward_cfg["distance_progress_weight"])
         if "forward_speed_weight" in reward_cfg:
             self.reward_forward_speed_weight = float(reward_cfg["forward_speed_weight"])
         if "front_speed_weight" in reward_cfg:
@@ -303,6 +306,78 @@ class RacerEnv:
         self.lidar_spike_prob = float(obs_noise_cfg.get("lidar_spike_prob", 0.0))
         self.speed_noise_std = float(obs_noise_cfg.get("speed_noise_std", 0.0))
         self.servo_noise_std = float(obs_noise_cfg.get("servo_noise_std", 0.0))
+
+        # S6: LiDAR beam divergence + ego-motion blur
+        lidar_sim_cfg = self.sim_cfg.get("lidar_sim", {})
+        self.lidar_beam_divergence_enabled = self.sim_enabled and bool(lidar_sim_cfg.get("beam_divergence", False))
+        self.lidar_beam_noise_std = float(lidar_sim_cfg.get("beam_noise_std", 0.03))
+        self.lidar_ego_motion_blur_enabled = self.sim_enabled and bool(lidar_sim_cfg.get("ego_motion_blur", False))
+        self.lidar_scan_time_s = float(lidar_sim_cfg.get("scan_time_s", 0.125))  # 8 Hz
+
+        # S7: IMU observation + encoder noise
+        imu_cfg = self.sim_cfg.get("imu", {})
+        self.imu_enabled = self.sim_enabled and bool(imu_cfg.get("enabled", False))
+        self.imu_max_accel = float(imu_cfg.get("max_accel", 4.0))  # m/s²
+        self.imu_max_yaw_rate = float(imu_cfg.get("max_yaw_rate", 3.0))  # rad/s
+        self.encoder_noise_enabled = self.sim_enabled and bool(imu_cfg.get("encoder_noise", False))
+        self.encoder_noise_std = float(imu_cfg.get("encoder_noise_std", 0.03))  # 3% VESC noise
+        # State for IMU delta computation
+        self._prev_speed = 0.0
+        self._prev_angle = 0.0
+
+        # S8: Soft collision — allow light contacts before termination
+        collision_cfg = self.sim_cfg.get("soft_collision", {})
+        self.soft_collision_enabled = self.sim_enabled and bool(collision_cfg.get("enabled", False))
+        self.max_light_contacts = int(collision_cfg.get("max_light_contacts", 2))
+        self.light_contact_penalty = float(collision_cfg.get("light_contact_penalty", -5.0))
+        self._contact_count = 0
+
+        # S9: Remove alignment reward, add distance progress
+        progress_cfg = self.sim_cfg.get("distance_progress", {})
+        self.distance_progress_enabled = self.sim_enabled and bool(progress_cfg.get("enabled", False))
+
+        # S10: Async sensor delays
+        sensor_delay_cfg = self.sim_cfg.get("sensor_delay", {})
+        self.sensor_delay_enabled = self.sim_enabled and bool(sensor_delay_cfg.get("enabled", False))
+        self.lidar_delay_range = self._parse_int_range(sensor_delay_cfg.get("lidar_delay_frames"), (3, 4))
+        self.speed_delay_range = self._parse_int_range(sensor_delay_cfg.get("speed_delay_frames"), (1, 3))
+        self.imu_delay_range = self._parse_int_range(sensor_delay_cfg.get("imu_delay_frames"), (0, 1))
+        max_lidar_buf = max(self.lidar_delay_range[1] + 1, 10)
+        self._lidar_obs_history: Deque[np.ndarray] = deque(maxlen=max_lidar_buf)
+        self._speed_obs_history: Deque[float] = deque(maxlen=max(self.speed_delay_range[1] + 1, 5))
+        self._imu_obs_history: Deque[Tuple[float, float]] = deque(maxlen=max(self.imu_delay_range[1] + 1, 3))
+        # Per-episode delay samples (set in reset, initialized here to avoid AttributeError)
+        self._ep_lidar_delay = 0
+        self._ep_speed_delay = 0
+        self._ep_imu_delay = 0
+
+        # S12: Wind and slope perturbations
+        wind_slope_cfg = self.sim_cfg.get("wind_slope", {})
+        self.wind_enabled = self.sim_enabled and bool(wind_slope_cfg.get("wind_enabled", False))
+        self.wind_force_std = float(wind_slope_cfg.get("wind_force_std", 0.3))
+        self.wind_freq_hz = float(wind_slope_cfg.get("wind_freq_hz", 0.5))
+        self.slope_enabled = self.sim_enabled and bool(wind_slope_cfg.get("slope_enabled", False))
+        self.slope_range = self._parse_range(wind_slope_cfg.get("slope_range"), (-0.035, 0.035))
+        self._slope_angle = 0.0
+        self._wind_phase = 0.0
+        self._wind_ou_state = 0.0  # OU process state for temporally correlated wind
+        self._wind_ou_theta = 0.15  # mean-reversion rate (same as thermal drift)
+
+        # S13: Continuous domain randomization (battery sag, friction cycle)
+        continuous_dr_cfg = self.sim_cfg.get("continuous_dr", {})
+        self.continuous_dr_enabled = self.sim_enabled and bool(continuous_dr_cfg.get("enabled", False))
+        self.battery_sag_pct = float(continuous_dr_cfg.get("battery_sag_pct", 0.05))  # 5% drop
+        self.friction_cycle_amplitude = float(continuous_dr_cfg.get("friction_cycle_amplitude", 0.02))
+        self.friction_cycle_period_s = float(continuous_dr_cfg.get("friction_cycle_period_s", 30.0))
+
+        # S14: Sensor thermal drift (Ornstein-Uhlenbeck process)
+        thermal_cfg = self.sim_cfg.get("thermal_drift", {})
+        self.thermal_drift_enabled = self.sim_enabled and bool(thermal_cfg.get("enabled", False))
+        self._ou_theta = float(thermal_cfg.get("ou_theta", 0.15))  # mean-reversion speed
+        self._ou_sigma_lidar = float(thermal_cfg.get("ou_sigma_lidar", 0.005))  # LiDAR volatility
+        self._ou_sigma_speed = float(thermal_cfg.get("ou_sigma_speed", 0.005))  # speed volatility
+        self._lidar_bias = 0.0
+        self._speed_bias = 0.0
 
         control_cfg = self.sim_cfg.get("control", {})
         self.control_enabled = self.sim_enabled and bool(control_cfg.get("enabled", False))
@@ -708,23 +783,41 @@ class RacerEnv:
             return None
         return t_min if t_min >= 0.0 else t_max
 
-    def _ray_obstacle_intersection(self, origin: pygame.Vector2, angle: float, max_distance: float) -> Tuple[float | None, pygame.Vector2 | None]:
-        if not self._obstacles:
-            return None, None
-        direction = pygame.Vector2(math.cos(angle), math.sin(angle))
+    def _ray_obstacle_intersection_cached(
+        self,
+        origin: pygame.Vector2,
+        direction: pygame.Vector2,
+        max_distance: float,
+        obstacle_cache: list[Tuple[pygame.Vector2, pygame.Vector2, float]],
+    ) -> Tuple[float | None, pygame.Vector2 | None]:
         best_dist: float | None = None
         best_point: pygame.Vector2 | None = None
-        for obs in self._obstacles:
-            min_pt = obs.position - obs.half_size
-            max_pt = obs.position + obs.half_size
-            hit_dist = self._ray_aabb_intersection(origin, direction, min_pt, max_pt)
+        early_exit_dist = max_distance * 0.1
+        _ray_aabb = self._ray_aabb_intersection
+        ox = origin.x
+        oy = origin.y
+        for min_pt, max_pt, obs_radius in obstacle_cache:
+            # Quick sphere pre-filter: skip if obstacle center is too far
+            # The obstacle center is at midpoint of min_pt and max_pt
+            cx = (min_pt.x + max_pt.x) * 0.5
+            cy = (min_pt.y + max_pt.y) * 0.5
+            dx = cx - ox
+            dy = cy - oy
+            center_dist_sq = dx * dx + dy * dy
+            reach = max_distance + obs_radius
+            if center_dist_sq > reach * reach:
+                continue
+            hit_dist = _ray_aabb(origin, direction, min_pt, max_pt)
             if hit_dist is None:
+                continue
+            if best_dist is not None and hit_dist >= best_dist:
                 continue
             if hit_dist > max_distance:
                 continue
-            if best_dist is None or hit_dist < best_dist:
-                best_dist = hit_dist
-                best_point = origin + direction * hit_dist
+            best_dist = hit_dist
+            best_point = origin + direction * hit_dist
+            if best_dist <= early_exit_dist:
+                break
         return best_dist, best_point
 
     def _vehicle_hits_obstacle(self, obs: _Obstacle) -> bool:
@@ -762,6 +855,11 @@ class RacerEnv:
         steer = float(action_arr[0])
         accel_cmd = float(action_arr[1])
         return np.array([steer, accel_cmd], dtype=np.float32)
+
+    @property
+    def wants_new_action(self) -> bool:
+        """True when action_repeat window expired and env needs a fresh action."""
+        return self.action_repeat_steps <= 1 or self._repeat_count <= 0
 
     def _apply_action_repeat(self, action: np.ndarray) -> np.ndarray:
         if self.action_repeat_steps <= 1:
@@ -844,6 +942,23 @@ class RacerEnv:
             self.vehicle.speed = max_speed
         elif self.vehicle.speed < -max_reverse:
             self.vehicle.speed = -max_reverse
+
+    def _apply_wind_slope(self, dt: float) -> None:
+        """S12: Apply wind gusts (lateral) and slope (longitudinal) perturbations."""
+        if self.wind_enabled:
+            # W2 fix: OU process for temporally correlated wind instead of i.i.d. noise
+            theta = self._wind_ou_theta
+            noise = float(np.random.normal(0.0, self.wind_force_std * math.sqrt(2.0 * theta * dt)))
+            self._wind_ou_state += -theta * self._wind_ou_state * dt + noise
+            t = self.episode_time_s
+            wind_force = self._wind_ou_state * math.sin(
+                2.0 * math.pi * t * self.wind_freq_hz + self._wind_phase
+            )
+            lateral_dir = pygame.Vector2(-math.sin(self.vehicle.angle), math.cos(self.vehicle.angle))
+            self.vehicle.position += lateral_dir * (wind_force * dt)
+        if self.slope_enabled and self._slope_angle != 0.0:
+            gravity_accel = 9.81 * math.sin(self._slope_angle)
+            self.vehicle.speed += gravity_accel * dt
 
     def _stuck_penalty(self, dt: float, collision: bool) -> float:
         if collision:
@@ -1031,15 +1146,50 @@ class RacerEnv:
         origin = self.vehicle.position
         base_angle = self.vehicle.angle
         readings = []
-        for angle_deg, offset in zip(self.lidar_angles_deg, self.lidar_offsets):
-            ray_angle = base_angle + offset
-            distance_m, hit_point = self._cast_ray(origin, ray_angle)
-            if self._episode_obstacles_active and self._obstacles:
-                obs_dist, obs_hit = self._ray_obstacle_intersection(origin, ray_angle, distance_m)
+        check_obstacles = self._episode_obstacles_active and bool(self._obstacles)
+
+        # S6: Ego-motion blur — compute yaw rate for scan distortion
+        n_rays = len(self.lidar_angles_deg)
+        ego_blur = self.lidar_ego_motion_blur_enabled and n_rays > 1
+        if ego_blur:
+            # Compute yaw rate from bicycle model: yaw_rate = speed/wheelbase * tan(steer)
+            wb = self.vehicle_params.wheelbase
+            steer_angle = getattr(self.vehicle, 'servo_actual', 0.0)
+            if wb > 0 and abs(steer_angle) > 1e-4 and abs(self.vehicle.speed) > 0.05:
+                yaw_rate = (self.vehicle.speed / wb) * math.tan(steer_angle)
+            else:
+                yaw_rate = 0.0
+            scan_time = self.lidar_scan_time_s
+
+        if check_obstacles:
+            # Cache obstacle AABB bounds and radii once for all rays
+            obstacle_cache = [
+                (obs.position - obs.half_size, obs.position + obs.half_size, obs.radius)
+                for obs in self._obstacles
+            ]
+            _intersect = self._ray_obstacle_intersection_cached
+            for i, (angle_deg, offset) in enumerate(zip(self.lidar_angles_deg, self.lidar_offsets)):
+                ray_angle = base_angle + offset
+                # S6: Apply ego-motion blur distortion
+                if ego_blur:
+                    ray_time_offset = scan_time * (i / n_rays)
+                    ray_angle += yaw_rate * ray_time_offset
+                distance_m, hit_point = self._cast_ray(origin, ray_angle)
+                direction = pygame.Vector2(math.cos(ray_angle), math.sin(ray_angle))
+                obs_dist, obs_hit = _intersect(origin, direction, distance_m, obstacle_cache)
                 if obs_dist is not None and obs_hit is not None:
                     distance_m = obs_dist
                     hit_point = obs_hit
-            readings.append((angle_deg, distance_m, hit_point))
+                readings.append((angle_deg, distance_m, hit_point))
+        else:
+            for i, (angle_deg, offset) in enumerate(zip(self.lidar_angles_deg, self.lidar_offsets)):
+                ray_angle = base_angle + offset
+                # S6: Apply ego-motion blur distortion
+                if ego_blur:
+                    ray_time_offset = scan_time * (i / n_rays)
+                    ray_angle += yaw_rate * ray_time_offset
+                distance_m, hit_point = self._cast_ray(origin, ray_angle)
+                readings.append((angle_deg, distance_m, hit_point))
         return readings
 
     def _vehicle_collision(self) -> bool:
@@ -1113,25 +1263,63 @@ class RacerEnv:
         return False
 
     def _build_observation(self, readings: list[Tuple[float, float, pygame.Vector2]], collision: bool) -> np.ndarray:
-        lidar_norm = []
-        range_mm = self.lidar_max_range_m * 1000.0
-        for _, distance_m, _ in readings:
-            distance_mm = distance_m * 1000.0
-            lidar_norm.append(min(distance_mm / range_mm, 1.0))
-        lidar_norm = np.array(lidar_norm, dtype=np.float32)
+        n_lidar = len(readings)
+        # S7: obs_dim = n_lidar + 5 (collision, speed, servo, linear_accel, angular_vel)
+        obs = np.empty(n_lidar + 5, dtype=np.float32)
+
+        # Vectorized lidar normalization: extract distances in one shot
+        inv_range = 1.0 / self.lidar_max_range_m
+        for i in range(n_lidar):
+            d = readings[i][1] * inv_range
+            obs[i] = d if d < 1.0 else 1.0
+
+        # S6: Beam divergence — distance-dependent noise (stacks with DR noise)
+        if self.lidar_beam_divergence_enabled:
+            lidar_slice = obs[:n_lidar]
+            beam_std = self.lidar_beam_noise_std
+            # Noise std scales linearly with normalized distance (0 at origin, beam_std at max range)
+            noise_stds = beam_std * lidar_slice
+            lidar_slice += np.random.normal(0.0, 1.0, size=n_lidar) * noise_stds
+            np.clip(lidar_slice, 0.0, 1.0, out=lidar_slice)
 
         if self.obs_noise_enabled:
+            lidar_slice = obs[:n_lidar]
             if self.lidar_noise_std > 0.0:
-                lidar_norm += np.random.normal(0.0, self.lidar_noise_std, size=lidar_norm.shape)
+                lidar_slice += np.random.normal(0.0, self.lidar_noise_std, size=n_lidar)
             if self.lidar_dropout_prob > 0.0:
-                drop_mask = np.random.random(size=lidar_norm.shape) < self.lidar_dropout_prob
-                lidar_norm[drop_mask] = 1.0
+                drop_mask = np.random.random(size=n_lidar) < self.lidar_dropout_prob
+                lidar_slice[drop_mask] = 1.0
             if self.lidar_spike_prob > 0.0:
-                spike_mask = np.random.random(size=lidar_norm.shape) < self.lidar_spike_prob
-                lidar_norm[spike_mask] = 0.0
-            lidar_norm = np.clip(lidar_norm, 0.0, 1.0)
+                spike_mask = np.random.random(size=n_lidar) < self.lidar_spike_prob
+                lidar_slice[spike_mask] = 0.0
+            np.clip(lidar_slice, 0.0, 1.0, out=lidar_slice)
 
-        speed_kmh = abs(self.vehicle.speed) * 3.6
+        # S14: Sensor thermal drift (Ornstein-Uhlenbeck)
+        if self.thermal_drift_enabled:
+            dt_ou = self.last_dt
+            sqrt_dt = math.sqrt(dt_ou) if dt_ou > 0 else 0.0
+            self._lidar_bias += (
+                self._ou_theta * (0.0 - self._lidar_bias) * dt_ou
+                + self._ou_sigma_lidar * sqrt_dt * float(np.random.normal())
+            )
+            self._speed_bias += (
+                self._ou_theta * (0.0 - self._speed_bias) * dt_ou
+                + self._ou_sigma_speed * sqrt_dt * float(np.random.normal())
+            )
+            lidar_slice = obs[:n_lidar]
+            lidar_slice += self._lidar_bias
+            np.clip(lidar_slice, 0.0, 1.0, out=lidar_slice)
+
+        # S7: Encoder noise on speed measurement
+        speed_raw = self.vehicle.speed
+        if self.encoder_noise_enabled:
+            noise_std = self.encoder_noise_std * max(abs(speed_raw), 0.1)
+            speed_raw = speed_raw + float(np.random.normal(0.0, noise_std))
+        # S14: Apply speed thermal drift bias
+        if self.thermal_drift_enabled:
+            speed_raw += self._speed_bias
+
+        speed_kmh = abs(speed_raw) * 3.6
         max_speed_kmh = max(self.vehicle_params.max_speed * 3.6, 1e-3)
         speed_norm = min(speed_kmh / max_speed_kmh, 1.0)
         servo_norm = min(max(self.servo_value / 20.0, 0.0), 1.0)
@@ -1143,11 +1331,44 @@ class RacerEnv:
             speed_norm = min(max(speed_norm, 0.0), 1.0)
             servo_norm = min(max(servo_norm, 0.0), 1.0)
 
-        obs = np.array(
-            list(lidar_norm) + [1.0 if collision else 0.0, speed_norm, servo_norm],
-            dtype=np.float32,
-        )
-        return np.round(obs, 3)
+        # S7: IMU values — linear acceleration and angular velocity
+        dt = self.last_dt
+        if dt > 0:
+            linear_accel = (self.vehicle.speed - self._prev_speed) / dt
+            angular_velocity = (self.vehicle.angle - self._prev_angle) / dt
+        else:
+            linear_accel = 0.0
+            angular_velocity = 0.0
+        self._prev_speed = self.vehicle.speed
+        self._prev_angle = self.vehicle.angle
+        linear_accel_norm = max(-1.0, min(1.0, linear_accel / self.imu_max_accel))
+        angular_vel_norm = max(-1.0, min(1.0, angular_velocity / self.imu_max_yaw_rate))
+
+        # S10: Async sensor delays — push current values, pull delayed
+        if self.sensor_delay_enabled:
+            self._lidar_obs_history.append(obs[:n_lidar].copy())
+            self._speed_obs_history.append(speed_norm)
+            self._imu_obs_history.append((linear_accel_norm, angular_vel_norm))
+
+            # W1 fix: use per-episode base delay with ±1 frame jitter
+            lidar_delay = max(0, self._ep_lidar_delay + int(np.random.randint(-1, 2)))
+            speed_delay = max(0, self._ep_speed_delay + int(np.random.randint(-1, 2)))
+            imu_delay = max(0, self._ep_imu_delay + int(np.random.randint(-1, 2)))
+
+            lidar_idx = min(lidar_delay, len(self._lidar_obs_history) - 1)
+            speed_idx = min(speed_delay, len(self._speed_obs_history) - 1)
+            imu_idx = min(imu_delay, len(self._imu_obs_history) - 1)
+
+            obs[:n_lidar] = self._lidar_obs_history[-(lidar_idx + 1)]
+            speed_norm = self._speed_obs_history[-(speed_idx + 1)]
+            linear_accel_norm, angular_vel_norm = self._imu_obs_history[-(imu_idx + 1)]
+
+        obs[n_lidar] = 1.0 if collision else 0.0
+        obs[n_lidar + 1] = speed_norm
+        obs[n_lidar + 2] = servo_norm
+        obs[n_lidar + 3] = linear_accel_norm
+        obs[n_lidar + 4] = angular_vel_norm
+        return obs
 
     def _compute_reward(self, readings: list[Tuple[float, float, pygame.Vector2]], collision: bool) -> float:
         if collision:
@@ -1182,12 +1403,23 @@ class RacerEnv:
         reverse_speed_norm = min(max(-signed_speed, 0.0) / max_speed, 1.0)
         side_clear = 0.5 * (left + right)
 
-        alignment = self._clockwise_alignment()
-        reward_forward = alignment * (
-            self.reward_forward_speed_weight * forward_speed_norm
-            + self.reward_front_speed_weight * forward_speed_norm * front
-        )
-        reward = reward_forward + self.reward_alignment_bonus * alignment
+        if self.distance_progress_enabled:
+            # S9: Distance progress reward (replaces alignment-based reward)
+            delta_pos = self.vehicle.position - self.prev_position
+            heading = pygame.Vector2(math.cos(self.vehicle.angle), math.sin(self.vehicle.angle))
+            forward_progress = delta_pos.dot(heading)
+            reward_forward = (
+                self.reward_forward_speed_weight * forward_speed_norm
+                + self.reward_front_speed_weight * forward_speed_norm * front
+            )
+            reward = reward_forward + self.reward_distance_progress_weight * forward_progress
+        else:
+            alignment = self._clockwise_alignment()
+            reward_forward = alignment * (
+                self.reward_forward_speed_weight * forward_speed_norm
+                + self.reward_front_speed_weight * forward_speed_norm * front
+            )
+            reward = reward_forward + self.reward_alignment_bonus * alignment
         reward -= self.reward_front_penalty * forward_speed_norm * (1.0 - front)
         reward -= self.reward_side_penalty * (1.0 - side_clear)
         reward -= self.reward_min_clear_penalty * (1.0 - min_clear)
@@ -1203,6 +1435,10 @@ class RacerEnv:
         self.vehicle.position = pygame.Vector2(spawn_position)
         self.vehicle.angle = spawn_angle
         self.vehicle.speed = 0.0
+        # B1: Reset actuator lag state from previous episode
+        self.vehicle.servo_actual = 0.0
+        self.vehicle.accel_actual = 0.0
+        self.vehicle.yaw_rate = 0.0
         self.servo_value = 10.0
         self.prev_position = self.vehicle.position.copy()
         self.stuck_time = 0.0
@@ -1210,6 +1446,30 @@ class RacerEnv:
         self.backward_penalized = False
         self.backward_death = False
         self.episode_time_s = 0.0
+        # S7: Reset IMU state
+        self._prev_speed = 0.0
+        self._prev_angle = spawn_angle
+        # S8: Reset contact counter
+        self._contact_count = 0
+        # S10: Reset sensor delay buffers and sample per-episode delays
+        self._lidar_obs_history.clear()
+        self._speed_obs_history.clear()
+        self._imu_obs_history.clear()
+        if self.sensor_delay_enabled:
+            self._ep_lidar_delay = self._sample_int_range(self.lidar_delay_range)
+            self._ep_speed_delay = self._sample_int_range(self.speed_delay_range)
+            self._ep_imu_delay = self._sample_int_range(self.imu_delay_range)
+        # S14: Reset thermal drift biases
+        self._lidar_bias = 0.0
+        self._speed_bias = 0.0
+        # S12: Randomize per-episode wind/slope
+        if self.slope_enabled:
+            self._slope_angle = float(np.random.uniform(self.slope_range[0], self.slope_range[1]))
+        else:
+            self._slope_angle = 0.0
+        if self.wind_enabled:
+            self._wind_phase = float(np.random.uniform(0.0, 2.0 * math.pi))
+            self._wind_ou_state = 0.0
         self._reset_obstacles()
         lidar_readings = self._compute_lidar()
         collision = self._vehicle_collision()
@@ -1231,12 +1491,39 @@ class RacerEnv:
         self.episode_time_s += dt
 
         self._maybe_spawn_dynamic_obstacle(dt)
-        self.vehicle.update(dt, False, False, steer, self.map_params, accel_cmd=accel_cmd)
+
+        # S13: Continuous DR — battery sag and friction cycle
+        step_map_params = self.map_params
+        if self.continuous_dr_enabled:
+            max_time = self.episode_time_limit_s if self.episode_time_limit_s > 0.0 else 60.0
+            time_frac = min(self.episode_time_s / max_time, 1.0)
+            battery_factor = 1.0 - self.battery_sag_pct * time_frac
+            accel_cmd = accel_cmd * battery_factor
+            if self.friction_cycle_period_s > 0.0:
+                friction_drift = self.friction_cycle_amplitude * math.sin(
+                    2.0 * math.pi * self.episode_time_s / self.friction_cycle_period_s
+                )
+                new_friction = max(0.0, self.map_params.surface_friction * (1.0 + friction_drift))
+                step_map_params = replace(self.map_params, surface_friction=new_friction)
+
+        self.vehicle.update(dt, False, False, steer, step_map_params, accel_cmd=accel_cmd)
         self._apply_perturbations(dt)
+        self._apply_wind_slope(dt)
         lidar_readings = self._compute_lidar()
         collision = self._vehicle_collision()
-        reward = self._compute_reward(lidar_readings, collision)
-        reward += self._stuck_penalty(dt, collision)
+
+        # S8: Soft collision — allow light contacts before termination
+        hard_collision = collision
+        if collision and self.soft_collision_enabled:
+            self._contact_count += 1
+            if self._contact_count <= self.max_light_contacts:
+                hard_collision = False  # Treat as light contact, don't terminate
+
+        reward = self._compute_reward(lidar_readings, hard_collision)
+        # S8: Apply light contact penalty for soft collisions
+        if collision and not hard_collision:
+            reward += self.light_contact_penalty
+        reward += self._stuck_penalty(dt, hard_collision)
         reward *= self.reward_scale
         if self.reward_clip is not None:
             reward = max(-self.reward_clip, min(self.reward_clip, reward))
@@ -1252,8 +1539,8 @@ class RacerEnv:
             self._render(lidar_readings)
 
         timeout = self.episode_time_limit_s > 0.0 and self.episode_time_s >= self.episode_time_limit_s
-        done = collision or self.backward_death or timeout
-        if collision:
+        done = hard_collision or self.backward_death or timeout
+        if hard_collision:
             if self._obstacle_collision:
                 death_reason = "obstacle"
             elif self._kill_boundary_hit:

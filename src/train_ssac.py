@@ -47,7 +47,7 @@ def _bump_nofile_limit() -> None:
     except Exception:
         return
     if hard == resource.RLIM_INFINITY:
-        target = soft
+        target = max(soft, 65536)
     else:
         target = hard
     if soft < target:
@@ -236,16 +236,10 @@ def _actor_worker(
     policy.eval()
     device_t = torch.device(device)
 
-    try:
-        weights = weights_queue.get(timeout=60.0)
-        policy.load_state_dict(weights)
-        # Diagnostic: compute weight checksum and check action_scale/bias
-        weight_sum = sum(v.sum().item() for v in policy.state_dict().values() if hasattr(v, 'sum'))
-        a_scale = policy.action_scale.cpu().numpy()
-        a_bias = policy.action_bias.cpu().numpy()
-        print(f"Actor {actor_id}: Loaded weights, checksum={weight_sum:.4f}, action_scale={a_scale}, action_bias={a_bias}", flush=True)
-    except queue_mod.Empty:
-        print(f"Actor {actor_id}: WARNING - No weights received, using random initialization!", flush=True)
+    init_weights = weights_queue.get(timeout=60)
+    policy.load_state_dict(init_weights)
+    weight_sum = sum(v.sum().item() for v in policy.state_dict().values() if hasattr(v, 'sum'))
+    print(f"Actor {actor_id}: Loaded initial weights, checksum={weight_sum:.4f}", flush=True)
 
     episode_idx = 1
     episode_reward = 0.0
@@ -283,25 +277,40 @@ def _actor_worker(
             map_block_remaining = map_switch_every
         map_block_remaining -= 1
 
+    action: np.ndarray | None = None  # set on first iteration (wants_new_action=True after reset)
+    decision_obs: np.ndarray | None = None  # obs at start of action-repeat window
+    accumulated_reward: float = 0.0  # reward summed over action-repeat window
+
     while not stop_event.is_set():
+        # Check for weight updates from learner
         try:
-            while True:
-                weights = weights_queue.get_nowait()
-                policy.load_state_dict(weights)
+            new_weights = weights_queue.get_nowait()
+            policy.load_state_dict(new_weights)
         except queue_mod.Empty:
             pass
 
-        with torch.no_grad():
-            obs_t = torch.tensor(obs, dtype=torch.float32, device=device_t).unsqueeze(0)
-            action_t, _, _ = policy.sample(obs_t)
-            action = action_t.cpu().numpy()[0]
+        # Only query policy when action_repeat window expired (C1 fix).
+        # Save the decision-point observation and reset reward accumulator.
+        if env.wants_new_action:
+            decision_obs = obs
+            accumulated_reward = 0.0
+            with torch.no_grad():
+                obs_t = torch.tensor(obs, dtype=torch.float32, device=device_t).unsqueeze(0)
+                action_t, _, _ = policy.sample(obs_t)
+                action = action_t.cpu().numpy()[0]
 
         next_obs, reward, done, distance_delta, death_reason = env.step(action)
         step_dt = env.last_dt
         episode_dt_sum += step_dt
         episode_dt_max = max(episode_dt_max, step_dt)
         episode_steps += 1
-        transition_queue.put((obs, action, reward, next_obs, done))
+        accumulated_reward += reward
+
+        # Store one transition per decision window (not per frame).
+        # Transition uses decision-point obs, accumulated reward over all
+        # repeat frames, and the observation at window end.
+        if done or env.wants_new_action:
+            transition_queue.put((decision_obs, action, accumulated_reward, next_obs, float(done)))
 
         episode_reward += reward
         if reward < 0:
@@ -589,7 +598,7 @@ def train_ssac() -> None:
     hidden_sizes = _parse_hidden_sizes(args.hidden_sizes, rl_cfg.get("hidden_sizes", [128, 128]))
     target_entropy = _parse_target_entropy(args.target_entropy or rl_cfg.get("target_entropy"), action_dim)
 
-    state_dim = (len(LIDAR_ANGLES_DEG) + 3) * max(1, stack_frames)
+    state_dim = (len(LIDAR_ANGLES_DEG) + 5) * max(1, stack_frames)  # +5: collision, speed, servo, linear_accel, angular_vel
     agent = SACAgent(
         state_dim=state_dim,
         action_dim=action_dim,
@@ -745,8 +754,9 @@ def train_ssac() -> None:
     ctx = mp.get_context("spawn")
     stop_event = ctx.Event()
     transition_queue: mp.Queue = ctx.Queue(maxsize=max(1, queue_size))
-    stats_queue: mp.Queue = ctx.Queue()
+    stats_queue: mp.Queue = ctx.Queue(maxsize=max(1, num_actors * 100))
     weights_queues: list[mp.Queue] = [ctx.Queue(maxsize=1) for _ in range(num_actors)]
+    init_weights = _cpu_state_dict(agent.policy)
     processes: list[mp.Process] = []
 
     for actor_id in range(num_actors):
@@ -783,15 +793,9 @@ def train_ssac() -> None:
         proc.start()
         processes.append(proc)
 
-    init_weights = _cpu_state_dict(agent.policy)
-    # Diagnostic: compute weight checksum before sending to actors
-    weight_sum = sum(v.sum().item() for v in init_weights.values() if hasattr(v, 'sum'))
-    a_scale = init_weights.get('action_scale', 'N/A')
-    a_bias = init_weights.get('action_bias', 'N/A')
-    print(f"Main process: Sending weights to actors, checksum={weight_sum:.4f}, action_scale={a_scale}, action_bias={a_bias}", flush=True)
-    for q in weights_queues:
-        _drain_queue(q)
-        q.put(init_weights)
+    # Broadcast initial weights to all actors
+    for wq in weights_queues:
+        wq.put(init_weights)
 
     distance_history: deque[float] = deque(maxlen=100)
     if loaded_distance_history:
@@ -839,27 +843,21 @@ def train_ssac() -> None:
         except Exception as e:
             print(f"Could not restore last logged episode from CSV: {e}")
 
-    # Warmup after resume: scale with actor count to keep per-actor warmup comparable
+    # Warmup after resume: fill replay buffer with fresh transitions before learning.
     base_warmup_steps = 37500
     base_actors = 4
     warmup_scale = max(1.0, float(num_actors) / float(base_actors))
     resume_warmup_steps = int(base_warmup_steps * warmup_scale) if episodes_completed > 0 else 0
     if resume_warmup_steps > 0:
         print(f"Resume warmup: delaying learning and weight sync for {resume_warmup_steps} steps")
-    print(f"  UTD ratio: {utd_ratio} (drain 512 × {utd_ratio} = ~{int(512 * utd_ratio)} updates/cycle)")
+    print(f"  UTD ratio: {utd_ratio}")
 
     total_episodes = episodes_completed
     episodes_done = 0
     logged_total_episodes = last_logged_episode if last_logged_episode is not None else episodes_completed
     logged_episodes_done = 0
     transitions = 0
-
-    def _ensure_csv_header() -> None:
-        if os.path.exists(session_csv) and os.path.getsize(session_csv) > 0:
-            return
-        with open(session_csv, "w", newline="", encoding="utf-8") as csv_file:
-            writer = csv.DictWriter(csv_file, fieldnames=csv_fieldnames)
-            writer.writeheader()
+    csv_header_written = csv_has_data
 
     def _build_csv_row(values: dict) -> dict:
         row = {name: "" for name in csv_fieldnames}
@@ -868,10 +866,20 @@ def train_ssac() -> None:
                 row[key] = value
         return row
 
+    def _write_csv_row(row: dict) -> None:
+        nonlocal csv_header_written
+        write_header = not csv_header_written
+        with open(session_csv, "a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=csv_fieldnames)
+            if write_header:
+                writer.writeheader()
+                csv_header_written = True
+            writer.writerow(row)
+            f.flush()
+
     def _write_config_snapshot() -> None:
         if not csv_supports_config:
             return
-        _ensure_csv_header()
         resolved = {
             "config": args.config,
             "physics": args.physics,
@@ -905,9 +913,7 @@ def train_ssac() -> None:
                 "config_json": json.dumps(config_snapshot, sort_keys=True),
             }
         )
-        with open(session_csv, "a", newline="", encoding="utf-8") as csv_file:
-            writer = csv.DictWriter(csv_file, fieldnames=csv_fieldnames)
-            writer.writerow(row)
+        _write_csv_row(row)
 
     def log_episode(
         episode_id: int,
@@ -925,32 +931,28 @@ def train_ssac() -> None:
         fps_mean: float,
     ) -> None:
         alpha_value = float(agent.alpha.item())
-        _ensure_csv_header()
-        with open(session_csv, "a", newline="", encoding="utf-8") as csv_file:
-            writer = csv.DictWriter(csv_file, fieldnames=csv_fieldnames)
-            row = _build_csv_row(
-                {
-                    "total_episode": episode_id,
-                    "episode_in_run": episode_in_run,
-                    "env_id": env_id,
-                    "distance_m": f"{distance:.4f}",
-                    "time_s": f"{time_s:.2f}",
-                    "reward_sum": f"{reward_sum:.6f}",
-                    "penalty_sum": f"{penalty_sum:.6f}",
-                    "mean_20": f"{mean_20:.4f}",
-                    "mean_100": f"{mean_100:.4f}",
-                    "alpha": f"{alpha_value:.6f}",
-                    "q_loss": f"{agent.last_q_loss:.6f}" if agent.last_q_loss is not None else "",
-                    "policy_loss": f"{agent.last_policy_loss:.6f}" if agent.last_policy_loss is not None else "",
-                    "alpha_loss": f"{agent.last_alpha_loss:.6f}" if agent.last_alpha_loss is not None else "",
-                    "entropy": f"{agent.last_entropy:.6f}" if agent.last_entropy is not None else "",
-                    "death_reason": death_reason or "collision",
-                    "row_type": "episode",
-                    "config_json": "",
-                }
-            )
-            writer.writerow(row)
-            csv_file.flush()
+        row = _build_csv_row(
+            {
+                "total_episode": episode_id,
+                "episode_in_run": episode_in_run,
+                "env_id": env_id,
+                "distance_m": f"{distance:.4f}",
+                "time_s": f"{time_s:.2f}",
+                "reward_sum": f"{reward_sum:.6f}",
+                "penalty_sum": f"{penalty_sum:.6f}",
+                "mean_20": f"{mean_20:.4f}",
+                "mean_100": f"{mean_100:.4f}",
+                "alpha": f"{alpha_value:.6f}",
+                "q_loss": f"{agent.last_q_loss:.6f}" if agent.last_q_loss is not None else "",
+                "policy_loss": f"{agent.last_policy_loss:.6f}" if agent.last_policy_loss is not None else "",
+                "alpha_loss": f"{agent.last_alpha_loss:.6f}" if agent.last_alpha_loss is not None else "",
+                "entropy": f"{agent.last_entropy:.6f}" if agent.last_entropy is not None else "",
+                "death_reason": death_reason or "collision",
+                "row_type": "episode",
+                "config_json": "",
+            }
+        )
+        _write_csv_row(row)
         q_loss_str = f"{agent.last_q_loss:.4f}" if agent.last_q_loss is not None else ""
         policy_loss_str = f"{agent.last_policy_loss:.4f}" if agent.last_policy_loss is not None else ""
         print(
@@ -961,7 +963,65 @@ def train_ssac() -> None:
             f"dt_mean={mean_dt:.4f}s fps={fps_mean:.1f} dt_max={max_dt:.4f}s"
         )
 
-    prev_sync_bucket = 0  # track sync_every crossings across batch drains
+    prev_sync_bucket = 0  # track sync_every crossings
+
+    def _drain_stats() -> None:
+        """Process all pending episode stats from actors."""
+        nonlocal total_episodes, episodes_done, logged_total_episodes, logged_episodes_done
+        while True:
+            try:
+                (
+                    env_id,
+                    distance,
+                    time_s,
+                    reward_sum,
+                    penalty_sum,
+                    death_reason,
+                    mean_dt,
+                    max_dt,
+                    fps_mean,
+                ) = stats_queue.get_nowait()
+            except queue_mod.Empty:
+                break
+            total_episodes += 1
+            episodes_done += 1
+            distance_history.append(distance)
+            mean_20 = _mean(list(distance_history)[-20:])
+            mean_100 = _mean(list(distance_history)[-100:])
+            if resume_warmup_steps <= 0 or transitions >= resume_warmup_steps:
+                logged_total_episodes += 1
+                logged_episodes_done += 1
+                log_episode(
+                    logged_total_episodes,
+                    logged_episodes_done,
+                    env_id,
+                    distance,
+                    time_s,
+                    reward_sum,
+                    penalty_sum,
+                    mean_20,
+                    mean_100,
+                    death_reason,
+                    mean_dt,
+                    max_dt,
+                    fps_mean,
+                )
+            if save_every > 0 and total_episodes % save_every == 0:
+                meta = {
+                    "session_id": session_id,
+                    "episodes_trained": total_episodes,
+                    "episodes_trained_total": total_episodes,
+                    "episodes_trained_logged": logged_total_episodes,
+                    "alpha": float(agent.alpha.item()),
+                    "num_envs": num_actors,
+                    "distance_history": list(distance_history),
+                }
+                _save_checkpoint_atomic(agent, session_ckpt, meta)
+                with open(session_meta, "w", encoding="utf-8") as handle:
+                    json.dump(meta, handle)
+                backup_name = f"session_{session_id}_Backup_{total_episodes}.pth"
+                backup_path = os.path.join(session_dir, backup_name)
+                _save_checkpoint_backup(session_ckpt, backup_path)
 
     try:
         if not csv_has_data:
@@ -970,113 +1030,65 @@ def train_ssac() -> None:
             if max_episodes > 0 and total_episodes >= max_episodes:
                 break
 
-            # --- Batch drain: pull up to 64 transitions at once ---
-            transitions_received = 0
-            # Block on first transition to avoid busy-looping
+            # --- Block on first transition (backpressure) ---
             try:
-                state, action, reward, next_state, done = transition_queue.get(timeout=0.1)
+                item = transition_queue.get(timeout=0.1)
             except queue_mod.Empty:
-                state = None
-            if state is not None:
-                agent.memory.add(state, np.asarray(action, dtype=np.float32), float(reward), next_state, bool(done))
+                _drain_stats()
+                continue
+
+            state, action, reward, next_state, done = item
+            agent.memory.add(state, action, reward, next_state, done)
+            agent.total_steps += 1
+            transitions += 1
+
+            # --- Drain burst of pending transitions ---
+            burst = 0
+            while burst < 512:
+                try:
+                    item = transition_queue.get_nowait()
+                except queue_mod.Empty:
+                    break
+                state, action, reward, next_state, done = item
+                agent.memory.add(state, action, reward, next_state, done)
                 agent.total_steps += 1
                 transitions += 1
-                transitions_received += 1
-                if transitions <= resume_warmup_steps:
-                    if transitions == 1:
-                        print(f"Warmup: collecting experiences without learning for {resume_warmup_steps} steps...")
-                    if transitions % 10000 == 0:
-                        print(f"Warmup progress: {transitions}/{resume_warmup_steps} steps")
-                # Drain remaining without blocking
-                drain_limit = min(512, max(0, transition_queue.qsize()))
-                for _ in range(drain_limit):
-                    try:
-                        state, action, reward, next_state, done = transition_queue.get_nowait()
-                    except queue_mod.Empty:
-                        break
-                    agent.memory.add(state, np.asarray(action, dtype=np.float32), float(reward), next_state, bool(done))
-                    agent.total_steps += 1
-                    transitions += 1
-                    transitions_received += 1
-                    if transitions <= resume_warmup_steps:
-                        if transitions % 10000 == 0:
-                            print(f"Warmup progress: {transitions}/{resume_warmup_steps} steps")
+                burst += 1
 
-            # --- Learning: batch updates proportional to transitions received ---
-            if transitions_received > 0 and transitions > resume_warmup_steps:
-                if transitions - transitions_received < resume_warmup_steps and resume_warmup_steps > 0:
-                    print(f"Warmup complete! Starting learning...")
-                can_learn = (len(agent.memory) >= agent.batch_size
-                             and agent.total_steps >= agent.learn_after)
-                if can_learn:
-                    num_updates = max(1, int(transitions_received * utd_ratio * agent.updates_per_step))
-                    for _ in range(num_updates):
-                        agent.last_loss = agent.learn()
+            transitions_received = burst + 1
+
+            # --- Warmup progress ---
+            if transitions <= resume_warmup_steps:
+                prev_t = transitions - transitions_received
+                if prev_t < 1 <= transitions:
+                    print(f"Warmup: collecting experiences without learning for {resume_warmup_steps} steps...")
+                if prev_t // 10000 < transitions // 10000:
+                    print(f"Warmup progress: {transitions}/{resume_warmup_steps} steps")
+            elif transitions - transitions_received <= resume_warmup_steps and resume_warmup_steps > 0:
+                print(f"Warmup complete! Starting learning...")
+
+            # --- Learn proportionally: utd_ratio gradient updates per transition ---
+            can_learn = (transitions > resume_warmup_steps
+                         and len(agent.memory) >= agent.batch_size
+                         and agent.total_steps >= agent.learn_after)
+            if can_learn:
+                num_updates = max(1, round(transitions_received * utd_ratio))
+                for _ in range(num_updates):
+                    agent.last_loss = agent.learn()
+
+            # --- Drain episode stats ---
+            _drain_stats()
 
             # --- Weight sync: check if we crossed a sync_every boundary ---
             if sync_every > 0 and transitions > resume_warmup_steps:
                 cur_bucket = transitions // sync_every
                 if cur_bucket > prev_sync_bucket:
                     prev_sync_bucket = cur_bucket
-                    latest = _cpu_state_dict(agent.policy)
-                    for q in weights_queues:
-                        _drain_queue(q)
-                        q.put(latest)
+                    new_weights = _cpu_state_dict(agent.policy)
+                    for wq in weights_queues:
+                        _drain_queue(wq)
+                        wq.put(new_weights)
 
-            while True:
-                try:
-                    (
-                        env_id,
-                        distance,
-                        time_s,
-                        reward_sum,
-                        penalty_sum,
-                        death_reason,
-                        mean_dt,
-                        max_dt,
-                        fps_mean,
-                    ) = stats_queue.get_nowait()
-                except queue_mod.Empty:
-                    break
-                total_episodes += 1
-                episodes_done += 1
-                distance_history.append(distance)
-                mean_20 = _mean(list(distance_history)[-20:])
-                mean_100 = _mean(list(distance_history)[-100:])
-                if resume_warmup_steps <= 0 or transitions >= resume_warmup_steps:
-                    logged_total_episodes += 1
-                    logged_episodes_done += 1
-                    log_episode(
-                        logged_total_episodes,
-                        logged_episodes_done,
-                        env_id,
-                        distance,
-                        time_s,
-                        reward_sum,
-                        penalty_sum,
-                        mean_20,
-                        mean_100,
-                        death_reason,
-                        mean_dt,
-                        max_dt,
-                        fps_mean,
-                    )
-                if save_every > 0 and total_episodes % save_every == 0:
-                    meta = {
-                        "session_id": session_id,
-                        "episodes_trained": total_episodes,
-                        "episodes_trained_total": total_episodes,
-                        "episodes_trained_logged": logged_total_episodes,
-                        "alpha": float(agent.alpha.item()),
-                        "num_envs": num_actors,
-                        "distance_history": list(distance_history),
-                    }
-                    _save_checkpoint_atomic(agent, session_ckpt, meta)
-                    with open(session_meta, "w", encoding="utf-8") as handle:
-                        json.dump(meta, handle)
-                    backup_name = f"session_{session_id}_Backup_{total_episodes}.pth"
-                    backup_path = os.path.join(session_dir, backup_name)
-                    _save_checkpoint_backup(session_ckpt, backup_path)
     finally:
         stop_event.set()
         for proc in processes:

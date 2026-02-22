@@ -109,7 +109,7 @@ class Game:
         self.lidar_angles_deg = list(LIDAR_ANGLES_DEG)
         self.lidar_offsets = [math.radians(90.0 - angle) for angle in self.lidar_angles_deg]
         self.lidar_max_range_m = float(LIDAR_MAX_RANGE_M)
-        self.lidar_state_dim = len(self.lidar_angles_deg) + 3
+        self.lidar_state_dim = len(self.lidar_angles_deg) + 5  # +5: collision, speed, servo, linear_accel, angular_vel
         self._lidar_line_len = 0
 
         self.base_scale = self._compute_base_scale(display_cfg, window_cfg)
@@ -159,23 +159,13 @@ class Game:
         self.episode_time = 0.0
         self.prev_position = self.vehicle.position.copy()
         self.stuck_time = 0.0
-        self.backward_distance_m = 0.0
-        self.backward_penalized = False
-        self.backward_death = False
-        self._obs_stack.clear()
-        self._stack_reset = True
-        self.backward_distance_m = 0.0
-        self.backward_penalized = False
-        self.backward_death = False
-        self._obs_stack.clear()
-        self._stack_reset = True
         self.stuck_speed_thresh = 0.1
         self.stuck_grace_s = 0.5
         self.stuck_tau = 1.5
         self.stuck_scale = 3.0
         self.stuck_penalty_cap = 0.5
         self.reward_scale = 0.8
-        self.reward_clip = 1.0
+        self.reward_clip = 20.0
         self.backward_distance_m = 0.0
         self.backward_limit_m = 4.0
         self.backward_penalized = False
@@ -183,6 +173,8 @@ class Game:
         self.stack_frames = int(rl_cfg.get("stack_frames", 1))
         self._obs_stack: deque[np.ndarray] = deque(maxlen=max(1, self.stack_frames))
         self._stack_reset = True
+        self._prev_speed = 0.0
+        self._prev_angle = self.vehicle.angle
         self.distance_history = deque(maxlen=100)
         self.total_episodes = 0
         self.episodes_done = 0
@@ -548,11 +540,22 @@ class Game:
         speed_norm = min(speed_kmh / max_speed_kmh, 1.0)
         servo_norm = min(max(self.servo_value / 20.0, 0.0), 1.0)
 
+        # IMU channels: linear_accel and angular_vel (matching racer_env +5 layout)
+        dt = 1.0 / max(self.fps, 1)
+        linear_accel = (self.vehicle.speed - self._prev_speed) / dt if dt > 0 else 0.0
+        angular_velocity = (self.vehicle.angle - self._prev_angle) / dt if dt > 0 else 0.0
+        self._prev_speed = self.vehicle.speed
+        self._prev_angle = self.vehicle.angle
+        max_accel = 4.0
+        max_yaw_rate = 3.0
+        linear_accel_norm = max(-1.0, min(1.0, linear_accel / max_accel))
+        angular_vel_norm = max(-1.0, min(1.0, angular_velocity / max_yaw_rate))
+
         obs = np.array(
-            lidar_norm + [1.0 if collision else 0.0, speed_norm, servo_norm],
+            lidar_norm + [1.0 if collision else 0.0, speed_norm, servo_norm, linear_accel_norm, angular_vel_norm],
             dtype=np.float32,
         )
-        return np.round(obs, 3)
+        return obs
 
     def _compute_reward(self, readings: list[Tuple[int, float, pygame.Vector2]], collision: bool) -> float:
         if collision:
@@ -586,12 +589,22 @@ class Game:
         self.vehicle.position = pygame.Vector2(spawn_position)
         self.vehicle.angle = spawn_angle
         self.vehicle.speed = 0.0
+        self.vehicle.servo_actual = 0.0
+        self.vehicle.accel_actual = 0.0
+        self.vehicle.yaw_rate = 0.0
         self.servo_value = 10.0
         self.episode_reward = 0.0
         self.episode_penalty = 0.0
         self.episode_distance = 0.0
         self.episode_time = 0.0
         self.prev_position = self.vehicle.position.copy()
+        self.backward_distance_m = 0.0
+        self.backward_penalized = False
+        self.backward_death = False
+        self.stuck_time = 0.0
+        self._stack_reset = True
+        self._prev_speed = 0.0
+        self._prev_angle = spawn_angle
         self.stuck_time = 0.0
 
     def _stuck_penalty(self, dt: float, collision: bool) -> float:

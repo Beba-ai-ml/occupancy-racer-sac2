@@ -9,15 +9,24 @@ import numpy as np
 
 
 class StateBuilder:
-    def __init__(self, stack_frames: int, lidar_dim: int, max_speed_mps: float) -> None:
+    def __init__(
+        self,
+        stack_frames: int,
+        lidar_dim: int,
+        max_speed_mps: float,
+        use_imu: bool = False,
+    ) -> None:
         self.stack_frames = max(1, int(stack_frames))
         self.lidar_dim = int(lidar_dim)
         self.max_speed_mps = float(max_speed_mps) if max_speed_mps > 0 else 1.0
+        self.use_imu = bool(use_imu)
+        # IMU channels are always present in training obs (+5: collision, speed, servo, linear_accel, angular_vel)
+        self._extra_dims = 5
         self._stack: Deque[np.ndarray] = deque(maxlen=self.stack_frames)
 
     @property
     def single_obs_dim(self) -> int:
-        return self.lidar_dim + 3
+        return self.lidar_dim + self._extra_dims
 
     @property
     def state_dim(self) -> int:
@@ -44,6 +53,8 @@ class StateBuilder:
         speed_mps: float,
         servo_normalized: float,
         collision_flag: float,
+        linear_accel: float = 0.0,
+        angular_vel: float = 0.0,
     ) -> np.ndarray:
         lidar_arr = np.asarray(lidar_normalized, dtype=np.float32).reshape(-1)
         if lidar_arr.size != self.lidar_dim:
@@ -54,8 +65,16 @@ class StateBuilder:
         servo_norm = min(max(float(servo_normalized), 0.0), 1.0)
         collision = 1.0 if float(collision_flag) > 0.0 else 0.0
 
+        scalars = [collision, speed_norm, servo_norm]
+        if self.use_imu:
+            max_accel = 4.0
+            max_yaw_rate = 3.0
+            accel_norm = max(-1.0, min(float(linear_accel) / max_accel, 1.0))
+            yaw_norm = max(-1.0, min(float(angular_vel) / max_yaw_rate, 1.0))
+            scalars.extend([accel_norm, yaw_norm])
+
         obs = np.array(
-            list(lidar_arr) + [collision, speed_norm, servo_norm],
+            list(lidar_arr) + scalars,
             dtype=np.float32,
         )
         return obs
@@ -66,8 +85,13 @@ class StateBuilder:
         speed_mps: float,
         servo_normalized: float,
         collision_flag: float = 0.0,
+        linear_accel: float = 0.0,
+        angular_vel: float = 0.0,
     ) -> np.ndarray:
-        obs = self._build_observation(lidar_normalized, speed_mps, servo_normalized, collision_flag)
+        obs = self._build_observation(
+            lidar_normalized, speed_mps, servo_normalized, collision_flag,
+            linear_accel, angular_vel,
+        )
         if self.stack_frames <= 1:
             self._stack.clear()
             self._stack.append(obs)

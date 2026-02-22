@@ -72,7 +72,7 @@ sim_randomization:
     servo_noise_std: 0.02
   control:
     enabled: true
-    delay_steps: [1, 3]
+    delay_steps: [0, 1]
     steer_rate_limit: 0.15
     accel_rate_limit: 0.4
   dt_jitter:
@@ -90,11 +90,57 @@ sim_randomization:
     yaw_rate_sigma_deg: 1.0
     speed_sigma: 0.1
   observation_delay:
+    enabled: false
+    p1: 0.0
+    p2: 0.0
+  # S6: LiDAR beam divergence + ego-motion blur
+  lidar_sim:
+    beam_divergence: true
+    beam_noise_std: 0.03
+    ego_motion_blur: true
+    scan_time_s: 0.125  # 8 Hz LiDAR
+  # S7: IMU in observation + encoder noise
+  imu:
     enabled: true
-    p1: 0.1
-    p2: 0.02
+    max_accel: 4.0
+    max_yaw_rate: 3.0
+    encoder_noise: true
+    encoder_noise_std: 0.03  # 3% VESC noise
+  # S8: Soft collision — allow light contacts
+  soft_collision:
+    enabled: true
+    max_light_contacts: 2
+    light_contact_penalty: -5.0
+  # S9: Distance progress reward (replaces alignment)
+  distance_progress:
+    enabled: true
+  # S10: Async sensor delays
+  sensor_delay:
+    enabled: true
+    lidar_delay_frames: [3, 4]
+    speed_delay_frames: [1, 3]
+    imu_delay_frames: [0, 1]
+  # S12: Wind perturbations (slope removed — indoor floor is flat)
+  wind_slope:
+    wind_enabled: true
+    wind_force_std: 0.3
+    wind_freq_hz: 0.5
+    slope_enabled: false
+    slope_range: [0.0, 0.0]
+  # S13: Continuous DR (battery sag, friction cycle)
+  continuous_dr:
+    enabled: true
+    battery_sag_pct: 0.05
+    friction_cycle_amplitude: 0.02
+    friction_cycle_period_s: 30.0
+  # S14: Sensor thermal drift (Ornstein-Uhlenbeck)
+  thermal_drift:
+    enabled: true
+    ou_theta: 0.15
+    ou_sigma_lidar: 0.005
+    ou_sigma_speed: 0.005
   action_repeat:
-    steps: 1
+    steps: 8
   obstacles:
     enabled: false
     episode_prob: 0.6

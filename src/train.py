@@ -183,7 +183,7 @@ def train() -> None:
     hidden_sizes = _parse_hidden_sizes(args.hidden_sizes, rl_cfg.get("hidden_sizes", [128, 128]))
     target_entropy = _parse_target_entropy(args.target_entropy or rl_cfg.get("target_entropy"), action_dim)
 
-    state_dim = (len(LIDAR_ANGLES_DEG) + 3) * max(1, stack_frames)
+    state_dim = (len(LIDAR_ANGLES_DEG) + 5) * max(1, stack_frames)  # +5: collision, speed, servo, linear_accel, angular_vel
     agent = SACAgent(
         state_dim=state_dim,
         action_dim=action_dim,
@@ -204,6 +204,8 @@ def train() -> None:
         updates_per_step=int(args.updates_per_step if args.updates_per_step is not None else rl_cfg.get("updates_per_step", 1)),
         hidden_sizes=hidden_sizes,
         device=device,
+        grad_clip=float(args.grad_clip if hasattr(args, 'grad_clip') and args.grad_clip is not None else rl_cfg.get("grad_clip", 0.0)),
+        alpha_min=float(args.alpha_min if hasattr(args, 'alpha_min') and args.alpha_min is not None else rl_cfg.get("alpha_min", 0.0)),
     )
     print(f"Using device: {agent.device}")
 
@@ -286,6 +288,25 @@ def train() -> None:
     episodes_done = 0
     step_time = 1.0 / fps if fps > 0 else 0.05
 
+    csv_fieldnames = [
+        "total_episode",
+        "episode_in_run",
+        "env_id",
+        "distance_m",
+        "time_s",
+        "reward_sum",
+        "penalty_sum",
+        "mean_20",
+        "mean_100",
+        "alpha",
+        "q_loss",
+        "policy_loss",
+        "alpha_loss",
+        "entropy",
+        "death_reason",
+    ]
+    csv_header_written = os.path.exists(session_csv) and os.path.getsize(session_csv) > 0
+
     def log_episode(
         env_id: int,
         distance: float,
@@ -296,51 +317,33 @@ def train() -> None:
         mean_100: float,
         death_reason: str,
     ) -> None:
-        csv_needs_header = not os.path.exists(session_csv) or os.path.getsize(session_csv) == 0
+        nonlocal csv_header_written
         alpha_value = float(agent.alpha.item())
-        with open(session_csv, "a", newline="", encoding="utf-8") as csv_file:
-            writer = csv.DictWriter(
-                csv_file,
-                fieldnames=[
-                    "total_episode",
-                    "episode_in_run",
-                    "env_id",
-                    "distance_m",
-                    "time_s",
-                    "reward_sum",
-                    "penalty_sum",
-                    "mean_20",
-                    "mean_100",
-                    "alpha",
-                    "q_loss",
-                    "policy_loss",
-                    "alpha_loss",
-                    "entropy",
-                    "death_reason",
-                ],
-            )
-            if csv_needs_header:
+        row = {
+            "total_episode": total_episodes,
+            "episode_in_run": episodes_done,
+            "env_id": env_id,
+            "distance_m": f"{distance:.4f}",
+            "time_s": f"{time_s:.2f}",
+            "reward_sum": f"{reward_sum:.6f}",
+            "penalty_sum": f"{penalty_sum:.6f}",
+            "mean_20": f"{mean_20:.4f}",
+            "mean_100": f"{mean_100:.4f}",
+            "alpha": f"{alpha_value:.6f}",
+            "q_loss": f"{agent.last_q_loss:.6f}" if agent.last_q_loss is not None else "",
+            "policy_loss": f"{agent.last_policy_loss:.6f}" if agent.last_policy_loss is not None else "",
+            "alpha_loss": f"{agent.last_alpha_loss:.6f}" if agent.last_alpha_loss is not None else "",
+            "entropy": f"{agent.last_entropy:.6f}" if agent.last_entropy is not None else "",
+            "death_reason": death_reason or "collision",
+        }
+        write_header = not csv_header_written
+        with open(session_csv, "a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=csv_fieldnames)
+            if write_header:
                 writer.writeheader()
-            writer.writerow(
-                {
-                    "total_episode": total_episodes,
-                    "episode_in_run": episodes_done,
-                    "env_id": env_id,
-                    "distance_m": f"{distance:.4f}",
-                    "time_s": f"{time_s:.2f}",
-                    "reward_sum": f"{reward_sum:.6f}",
-                    "penalty_sum": f"{penalty_sum:.6f}",
-                    "mean_20": f"{mean_20:.4f}",
-                    "mean_100": f"{mean_100:.4f}",
-                    "alpha": f"{alpha_value:.6f}",
-                    "q_loss": f"{agent.last_q_loss:.6f}" if agent.last_q_loss is not None else "",
-                    "policy_loss": f"{agent.last_policy_loss:.6f}" if agent.last_policy_loss is not None else "",
-                    "alpha_loss": f"{agent.last_alpha_loss:.6f}" if agent.last_alpha_loss is not None else "",
-                    "entropy": f"{agent.last_entropy:.6f}" if agent.last_entropy is not None else "",
-                    "death_reason": death_reason or "collision",
-                }
-            )
-            csv_file.flush()
+                csv_header_written = True
+            writer.writerow(row)
+            f.flush()
         q_loss_str = f"{agent.last_q_loss:.4f}" if agent.last_q_loss is not None else ""
         policy_loss_str = f"{agent.last_policy_loss:.4f}" if agent.last_policy_loss is not None else ""
         print(
@@ -388,6 +391,7 @@ def train() -> None:
                             "episodes_trained": total_episodes,
                             "alpha": float(agent.alpha.item()),
                             "num_envs": num_envs,
+                            "distance_history": list(distance_history),
                         }
                         agent.save_checkpoint(session_ckpt, meta=meta)
                         with open(session_meta, "w", encoding="utf-8") as handle:

@@ -1,7 +1,7 @@
 config: config/game.yaml  # Path to the main game config YAML.
 physics: config/physics.yaml  # Path to the physics config YAML.
 map: K_01  # Initial map before rotation.
-map_pool: [K_01, K_02, K_03, K_04, K_05, K_06, K_07, K_08, K_09, K_10, K_11, K_12, K_13, K_14, K_15, K_16, K_17, K_18, K_19, K_20, K_21, K_22, K_23, K_24, K_25, K_26, K_27, K_28, K_29, K_30, K_31, K_32, K_33, K_34, K_35, K_36, K_37, K_38, K_39, K_40]
+map_pool: [K_01, K_02, K_03, K_04, K_05, K_06, K_07, K_08, K_09, K_10]  # 10 maps like best run.
 map_switch_start_episode: 1200  # Start map rotation after N episodes.
 map_switch_every: 10  # Keep a chosen map for N episodes before re-sampling.
 track_center: free  # Center used for track direction (map/free centroid).
@@ -9,33 +9,34 @@ track_direction: clockwise  # Preferred travel direction for alignment reward.
 spawn_face_forward: true  # Flip spawn heading if backward has more clearance.
 num_actors: 64  # Number of actor processes to run in parallel.
 fps: 60  # Simulated frames per second for the environment.
-sync_every: 6400  # Sync actor weights every N transitions (2x more often with half the actors).
-queue_size: 48000  # Max number of transitions buffered in the async queue.
+sync_every: 1600  # 12800/8: compensate for 1 transition per 8 frames with action_repeat.
+queue_size: 192000  # COMBO: 96K→192K to reduce actor blocking.
 save_every: 250  # Checkpoint every N episodes.
-session_id: SAC_P_10  # Session id used in checkpoint/log filenames.
+session_id: SAC_P_13  # Session id used in checkpoint/log filenames.
 save_dir: runs  # Directory for checkpoints and logs.
 load_from: null  # Optional checkpoint to load from; use null to auto-resume.
 no_resume: false  # Disable auto-resume when true.
 max_episodes: 0  # Stop after N episodes; 0 means unlimited.
-episode_time_limit_s: 60  # End episode after N seconds; 0 disables.
+episode_time_limit_s: 90  # End episode after N seconds. 90s reduces truncation bias (was 60).
 device: cuda  # Device to use for training (cpu/cuda/auto).
-stack_frames: 4  # Number of frames to stack in the observation.
-gamma: 0.99  # Discount factor for future rewards.
+stack_frames: 4  # Proven in best run. 8 doubles state_dim without evidence it helps.
+gamma: 0.99  # With accumulated reward per decision, gamma=0.99 gives 100-decision horizon = 13.3s.
 tau: 0.005  # Target network smoothing coefficient.
 policy_lr: 0.0003  # Actor learning rate.
-q_lr: 0.0003  # Critic learning rate (same as proven config_sac_8).
-alpha_lr: 0.0003  # Entropy learning rate.
-init_alpha: 0.2  # Initial entropy coefficient (same as proven config_sac_8).
+q_lr: 0.0003  # Critic learning rate (proven in best run).
+alpha_lr: 0.0001  # 3x slower alpha adaptation to prevent premature collapse (was 0.0003).
+init_alpha: 0.3  # Higher starting point = more exploration budget (was 0.2).
 target_entropy: auto  # Target entropy; use "auto" to infer from action space.
-batch_size: 1024  # Batch size for updates.
-memory_size: 1600000  # Replay buffer size.
+batch_size: 1024  # COMBO: 256→1024 for better GPU utilization.
+memory_size: 3000000  # COMBO: 1.6M→3M for more diverse sampling (fits 46GB RAM).
 start_steps: 0  # Random action steps before using the policy.
-learn_after: 20000  # Start learning after N steps (less warmup with fewer actors).
+learn_after: 5000  # 40000/8: same sim-time exploration before learning with action_repeat=8.
 update_every: 1  # Update frequency in steps.
 updates_per_step: 1  # Gradient updates per update step.
 hidden_sizes: [256, 256, 128]  # Hidden layer sizes for policy and critics.
 grad_clip: 1.0  # Gradient norm clipping to prevent Q-gradient explosions.
-alpha_min: 0.01  # Minimum alpha floor to keep exploration alive.
+alpha_min: 0.005  # Lower floor gives more gradient signal range before clamping (was 0.01).
+utd_ratio: 3.0  # COMBO: 2.0→3.0 for more gradient updates per transition.
 render_actor: 0  # Actor id to render (optional).
 render_every: 0  # Render every N episodes for the render actor; 0 disables.
 reward_scale: 0.8  # Scale applied to the final reward value.
@@ -91,7 +92,7 @@ dr_obs_delay_p2: 0.03  # Observation delay probability for t-2.
 action_repeat: 8  # Repeat each action 8 steps = 133ms ≈ 8Hz (matches real LiDAR rate).
 obst_enable: true  # Enable obstacles.
 obst_episode_prob: 0.3  # Probability that an episode has obstacles.
-obst_start_episode: 2400  # Start adding obstacles after N episodes.
+obst_start_episode: 5000  # Let driving mature before adding obstacles (was 2400).
 obst_max_static: 1  # Max static obstacles per episode.
 obst_max_total: 3  # Max total obstacles active.
 obst_static_size_range: [0.5, 1.0]  # Static obstacle size range (m).

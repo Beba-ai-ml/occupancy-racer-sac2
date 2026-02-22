@@ -219,16 +219,17 @@ class SACAgent:
         self.critic1_target.load_state_dict(self.critic1.state_dict())
         self.critic2_target.load_state_dict(self.critic2.state_dict())
 
+        _compile_mode = "default"
         if hasattr(torch, 'compile'):
             try:
-                self.critic1 = torch.compile(self.critic1, mode='default')
-                self.critic2 = torch.compile(self.critic2, mode='default')
-                print("torch.compile applied to critics")
+                self.critic1 = torch.compile(self.critic1, mode=_compile_mode)
+                self.critic2 = torch.compile(self.critic2, mode=_compile_mode)
+                print(f"torch.compile applied to critics (mode={_compile_mode})")
             except Exception as e:
                 print(f"torch.compile failed for critics: {e}")
             try:
-                self.policy = torch.compile(self.policy, mode='default')
-                print("torch.compile applied to policy")
+                self.policy = torch.compile(self.policy, mode=_compile_mode)
+                print(f"torch.compile applied to policy (mode={_compile_mode})")
             except Exception as e:
                 print(f"torch.compile failed for policy: {e}")
 
@@ -240,30 +241,20 @@ class SACAgent:
 
         if target_entropy is None:
             self.target_entropy = -float(action_dim)
-            self.auto_entropy = True
         else:
             self.target_entropy = float(target_entropy)
-            self.auto_entropy = True
 
-        if not self.auto_entropy:
-            self.log_alpha = None
-            self.alpha_optimizer = None
-            self.fixed_alpha = float(init_alpha)
-        else:
-            init_alpha = max(float(init_alpha), 1e-6)
-            self.log_alpha = torch.tensor(
-                np.log(init_alpha), dtype=torch.float32, requires_grad=True, device=self.device
-            )
-            self.alpha_optimizer = optim.Adam([self.log_alpha], lr=float(alpha_lr))
-            self.fixed_alpha = None
+        init_alpha = max(float(init_alpha), 1e-6)
+        self.log_alpha = torch.tensor(
+            np.log(init_alpha), dtype=torch.float32, requires_grad=True, device=self.device
+        )
+        self.alpha_optimizer = optim.Adam([self.log_alpha], lr=float(alpha_lr))
 
         self.memory = ReplayBuffer(memory_size, state_dim, action_dim)
 
     @property
     def alpha(self) -> torch.Tensor:
-        if self.auto_entropy:
-            return self.log_alpha.exp() if self.log_alpha is not None else torch.tensor(0.0)
-        return torch.tensor(self.fixed_alpha or 0.0, device=self.device)
+        return self.log_alpha.exp()
 
     def _random_action(self) -> np.ndarray:
         return np.random.uniform(self.action_low, self.action_high).astype(np.float32)
@@ -362,7 +353,7 @@ class SACAgent:
         self.policy_optimizer.step()
 
         alpha_loss = None
-        if self.auto_entropy and self.log_alpha is not None and self.alpha_optimizer is not None:
+        if self.log_alpha is not None and self.alpha_optimizer is not None:
             alpha_loss = -(self.log_alpha * (log_prob + self.target_entropy).detach()).mean()
             self.alpha_optimizer.zero_grad(set_to_none=True)
             alpha_loss.backward()
@@ -389,13 +380,16 @@ class SACAgent:
                 target_param.data.copy_(tau * param.data + (1.0 - tau) * target_param.data)
 
     def save_checkpoint(self, path: str, meta: dict | None = None) -> None:
+        def _clean_sd(sd: dict) -> dict:
+            return {k.removeprefix("_orig_mod."): v for k, v in sd.items()}
+
         payload = {
             "format": "sac_checkpoint_v1",
-            "policy": self.policy.state_dict(),
-            "critic1": self.critic1.state_dict(),
-            "critic2": self.critic2.state_dict(),
-            "critic1_target": self.critic1_target.state_dict(),
-            "critic2_target": self.critic2_target.state_dict(),
+            "policy": _clean_sd(self.policy.state_dict()),
+            "critic1": _clean_sd(self.critic1.state_dict()),
+            "critic2": _clean_sd(self.critic2.state_dict()),
+            "critic1_target": _clean_sd(self.critic1_target.state_dict()),
+            "critic2_target": _clean_sd(self.critic2_target.state_dict()),
             "policy_optimizer": self.policy_optimizer.state_dict(),
             "critic_optimizer": self.critic_optimizer.state_dict(),
             "log_alpha": float(self.log_alpha.item()) if self.log_alpha is not None else None,
