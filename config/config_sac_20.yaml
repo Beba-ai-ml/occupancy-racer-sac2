@@ -27,10 +27,10 @@ q_lr: 0.0003  # Critic learning rate (proven in best run).
 alpha_lr: 0.0001  # 3x slower alpha adaptation to prevent premature collapse (was 0.0003).
 init_alpha: 0.3  # Higher starting point = more exploration budget (was 0.2).
 target_entropy: auto  # Target entropy; use "auto" to infer from action space.
-batch_size: 1024  # TEST: 256→1024 to increase GPU utilization (was 30% with 256).
-memory_size: 1600000  # Replay buffer size.
+batch_size: 256  # Proven in Session 53 (250m). 1024 was slower to climb.
+memory_size: 8000000  # Replay buffer size (8M — ~2.5 hours retention at 64 actors).
 start_steps: 0  # Random action steps before using the policy.
-learn_after: 40000  # Buffer needs ~40K unique transitions for diversity before learning, regardless of action_repeat.
+learn_after: 5000  # Start learning early (Session 54 proved this works better than 40K).
 update_every: 1  # Update frequency in steps.
 updates_per_step: 1  # Gradient updates per update step.
 hidden_sizes: [256, 256, 128]  # Hidden layer sizes for policy and critics.

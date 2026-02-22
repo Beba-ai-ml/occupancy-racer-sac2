@@ -2,17 +2,18 @@
 
 ## Architecture
 
-Async SAC with 64 CPU actor processes + 1 GPU learner. Actors batch 32 transitions locally then send stacked numpy arrays through a shared mp.Queue (capped at 512 items for backpressure). Main loop pulls directly from queue (no intermediate drainer thread), inserts into replay buffer via batch slice assignment, and runs proportional gradient updates (N learns per N transitions, UTD ≈ 1.0). Weights synced to actors via POSIX shared memory (`/dev/shm`).
+Async SAC with 64 CPU actor processes + 1 GPU learner. Actors send single transitions through a shared mp.Queue (config-driven size, natural backpressure when full). Main loop pulls transitions one at a time via `queue.get()` / `get_nowait()`, inserts into replay buffer via `memory.add()`, and runs proportional gradient updates (UTD ≈ 1.0). Weights synced to actors via per-actor `mp.Queue(maxsize=1)`.
 
 ```
-[64 Actor Processes] --batch(32)--> [mp.Queue cap=512] --get_nowait--> [add_batch] --> [Replay Buffer]
-     |                     ↑ blocks when full                                               |
-     |                     (backpressure!)                                        sample_into(pinned)
-     |                                                                                      |
-     |                                                                                [GPU Learner]
-     |                                                                            (N learns per batch)
-     |                                                                                      |
-     |<----------------------- SharedWeightSync (/dev/shm, version counter) ----------------|
+[64 Actor Processes] --single transition--> [mp.Queue] --get/get_nowait--> [memory.add()] --> [Replay Buffer]
+     |                     ↑ blocks when full                                                        |
+     |                     (backpressure!)                                                     sample()
+     |                                                                                    pin_memory()
+     |                                                                                               |
+     |                                                                                     [GPU Learner]
+     |                                                                                  (N learns per N transitions)
+     |                                                                                               |
+     |<----------------------- weights_queues (mp.Queue per actor, maxsize=1) -----------------------|
 ```
 
 ### Observation Space
@@ -50,42 +51,36 @@ vehicle.py models physical actuator lag (servo 50ms, motor 100ms, tire slip, yaw
 
 ### Training
 - `src/train_ssac.py` — **Primary training script** (async, 64 actors). Entry point: `python -m src.train_ssac`
-  - **SharedWeightSync** (Phase 2): flattens policy state_dict into POSIX shared memory with int64 version counter. One memcpy replaces 64 queue pipes (~350x faster).
-  - **SharedWeightReader** (Phase 2): actor-side, checks version counter → reconstructs state_dict from flat buffer.
-  - **TransitionDrainer** (Phase 2): background thread drains batched numpy arrays from queue. **DEAD CODE** — class still exists but main loop bypasses it, pulling directly from queue for natural backpressure.
-  - **Main loop** (current): pulls one batch from queue per iteration via `get_nowait()`, does N `learn()` calls per N transitions (UTD ≈ 1.0). Queue capped at 512 items — actors block on `put()` when full.
-  - **Batched actor transitions** (Phase 2): actors accumulate 32 transitions locally (`_ACTOR_BATCH=32`), flush on batch-full or episode end. ~32x fewer IPC calls.
-  - Actor loop (line ~508): checks `env.wants_new_action` before querying policy (C1 fix)
+  - **Main loop**: blocks on `transition_queue.get(timeout=0.1)`, drains burst up to 512 via `get_nowait()`, `memory.add()` per transition, proportional learning, weight sync via `weights_queues`
+  - **Weight sync**: per-actor `mp.Queue(maxsize=1)` — drain stale then put fresh state_dict
+  - **Actor loop**: checks `env.wants_new_action` before querying policy (C1 fix). Single `transition_queue.put()` per decision window.
+  - **Warmup**: `base_warmup_steps=37500`, scaled by `num_actors/4`
+  - **Process context**: `mp.get_context("spawn")`
+  - **CSV logging**: direct file writes via `_write_csv_row()` helper
   - Stats queue bounded: `maxsize=num_actors*100` (W8 fix)
   - `_bump_nofile_limit()`: targets 65536 when hard==INFINITY (W5 fix)
 - `src/train.py` — Sync training script (secondary, legacy)
   - Now passes `grad_clip` and `alpha_min` to SACAgent (B5 fix)
   - Saves `distance_history` in checkpoint meta (W11 fix)
+  - Direct CSV writes (no background thread)
 - `src/sim_config.py` — Builds nested sim_cfg dict from flat YAML keys + CLI args
 
 ### Agent
 - `src/rl_agent.py` — SACAgent class, GaussianPolicy, twin Q-networks, ReplayBuffer, learn()
-  - ReplayBuffer: numpy-based, 1.6M capacity, pre-allocated index buffer
-    - `add_batch()`: numpy slice assignment with circular wraparound (Phase 2)
-    - `sample_into()`: writes directly into pre-pinned memory via `np.take(out=)` (Phase 2)
-  - **Pinned memory pool** (Phase 2): 5 pre-allocated pinned CPU tensors + numpy views in `__init__()`. Eliminates per-call `cudaHostRegister` syscalls in `learn()`.
-  - GPU transfers: sample_into → pinned pool → async non_blocking .to(device)
-  - Cached critic_params list for grad clipping
-  - torch.compile mode='default' (line ~284)
+  - ReplayBuffer: numpy-based, circular buffer with `add()` per transition
+  - `sample()` returns random batch, `learn()` does `pin_memory()` per call then async `non_blocking .to(device)`
+  - For-loop soft update (`_soft_update`) with tau
+  - torch.compile mode='default'
   - Alpha always auto-tuned (dead fixed_alpha code removed, W6 fix)
   - save_checkpoint strips `_orig_mod.` prefix (W7 fix)
 
 ### Environment
 - `src/racer_env.py` — RacerEnv: physics step, LiDAR raycasting, reward, observation building, all S6-S14 features
-  - `wants_new_action` property (~line 853): True when action_repeat window expired
-  - `_build_observation()` (~line 1260): builds 32-dim obs every sim frame
-  - `_compute_reward()` (~line 1380): S9 branches on distance_progress_enabled
-  - `step()` (~line 1465): full sim step including S8 soft collision, S13 continuous DR, S12 wind/slope
-  - `_apply_action_repeat()` (~line 858): holds action for N frames
-  - `_apply_wind_slope()` (~line 940): uses OU process for wind (W2 fix)
-  - `reset()` (~line 1419): resets vehicle actuator state (B1), samples per-episode sensor delays (W1), resets wind OU state
+  - `wants_new_action` property: True when action_repeat window expired
+  - `_build_observation()`: builds 32-dim obs every sim frame
+  - `_compute_reward()`: S9 branches on distance_progress_enabled
+  - `step()`: full sim step including S8 soft collision, S13 continuous DR, S12 wind/slope
   - S10 sensor delays: per-episode base with ±1 frame jitter per step (W1 fix)
-  - Default lidar_delay_range: (3,4) matching config (W3 fix)
 
 ### Vehicle Physics
 - `src/vehicle.py` — Ackermann bicycle model with:
@@ -105,16 +100,16 @@ vehicle.py models physical actuator lag (servo 50ms, motor 100ms, tire slip, yaw
   - Note: reward function still uses hardcoded values, not configurable like racer_env.py
 
 ### Infrastructure
-- `src/vec_env.py` — VecEnv with parallel recv via multiprocessing.connection.wait()
+- `src/vec_env.py` — VecEnv with sequential recv: `[remote.recv() for remote in self.remotes]`
 - `sac_driver/` — Real vehicle inference
   - `state_builder.py`: always uses 5 extra dims (B6 fix), use_imu flag only controls noise not dim count
   - `policy_loader.py`: loads GaussianPolicy for deployment
 
 ### Config
 - `config/game.yaml` — Base config with sim_randomization section (S6-S14 feature toggles live here)
-- `config/config_sac_13.yaml` — Best current config (flat keys override game.yaml via CLI args)
+- `config/config_sac_13.yaml` — Reference config (Session 53 baseline, batch=256)
+- `config/config_sac_20.yaml` — Current primary config (batch=256, learn_after=5000, memory_size=8M)
 - `config/config_sac_8/10/11/12.yaml` — Historical configs
-- `config/config_sac_20-25.yaml` — A/B test configs (batch_size, memory, queue, utd_ratio variations of 13)
 - `config/physics.yaml` — Vehicle physics parameters
 
 ### Documentation
@@ -123,7 +118,7 @@ vehicle.py models physical actuator lag (servo 50ms, motor 100ms, tire slip, yaw
 
 ## Tech Stack
 - Python 3.10+, PyTorch (CUDA), pygame (rendering/physics), numpy
-- multiprocessing (async actors, forkserver), multiprocessing.shared_memory (weight sync), threading (background CSV logger, transition drainer)
+- multiprocessing (async actors, spawn context), direct mp.Queue for weight sync and transitions
 - Hardware target: Jetson Nano Orin 8GB, ROS2 Foxy, VESC ESC, RPLidar (8Hz)
 
 ## How to Run
@@ -131,7 +126,7 @@ vehicle.py models physical actuator lag (servo 50ms, motor 100ms, tire slip, yaw
 ```bash
 cd /home/beba/occupancy_racer/Soft_Actor_Critic_2
 source .venv/bin/activate
-python -m src.train_ssac --config-file config/config_sac_13.yaml --session-id <NAME> --no-resume
+python -m src.train_ssac --config-file config/config_sac_20.yaml --session-id <NAME> --no-resume
 ```
 
 Key CLI flags:
@@ -149,11 +144,11 @@ Outputs go to `runs/session_<ID>/`:
 
 ## Hardware (Training Machine)
 - CPU: AMD Ryzen 7 5700X 8-Core (16 threads)
-- RAM: 46GB (28GB available during training)
-- GPU: CUDA-capable (exact model TBD)
-- Sweet spot: **64-160 actors** on this CPU. Beyond 160 = diminishing returns (context switching). 350+ = OOM crash.
-- After replay buffer fills: CPU ~30%, GPU ~30%. Bottleneck is **single-threaded main process** (drains queue + does gradient updates sequentially), NOT actor count.
-- Per-actor memory: ~100-150MB (map + physics + GaussianPolicy on CPU)
+- RAM: 46GB (~35GB used during training with 64 actors)
+- GPU: NVIDIA RTX 3080 10GB VRAM
+- Sweet spot: **64 actors** on this CPU. ~128-160 max before context-switching overhead.
+- Per-actor memory: ~440MB (map + physics + GaussianPolicy on CPU)
+- After replay buffer fills: CPU ~30%, GPU ~30%. Bottleneck is single-threaded main process.
 
 ## Conventions
 
@@ -164,7 +159,7 @@ CLI args > config_sac_*.yaml flat keys > game.yaml sim_randomization > defaults 
 game.yaml has nested `sim_randomization:` section. S6-S14 features (lidar_sim, imu, soft_collision, distance_progress, sensor_delay, wind_slope, continuous_dr, thermal_drift) are ONLY configurable here — no CLI arg equivalents. The flat `dr_*` keys in config_sac_*.yaml map to the older DR features (physics, surface, obs_noise, control, dt_jitter, action_noise, perturb, obs_delay).
 
 ### obs_dim
-Always 32 per frame (27 lidar + 5 state). Stacked x4 = 128. Hardcoded as `(len(LIDAR_ANGLES_DEG) + 5)` in train_ssac.py:647, train.py:237, and game.py:112. If obs format changes, ALL THREE files must be updated.
+Always 32 per frame (27 lidar + 5 state). Stacked x4 = 128. Hardcoded as `(len(LIDAR_ANGLES_DEG) + 5)` in train_ssac.py, train.py, and game.py. If obs format changes, ALL THREE files must be updated.
 
 ### torch.compile
 MUST use mode='default'. mode='reduce-overhead' uses CUDA graphs that deadlock with pin_memory() + non_blocking transfers. Checkpoint keys are stripped of `_orig_mod.` prefix in save_checkpoint.
@@ -172,19 +167,11 @@ MUST use mode='default'. mode='reduce-overhead' uses CUDA graphs that deadlock w
 ### Scaling actors
 More actors does NOT increase throughput past CPU saturation. With 16 threads, ~128-160 actors maximizes throughput. Beyond that, actors block on queue.put() (queue full) and context-switch overhead kills per-actor speed. Adding RAM only helps for bigger replay buffer, NOT more actors.
 
-### GPU utilization
-With hidden_sizes=[128,128] or [256,256,128] and batch_size=256, GPU sits at ~2-5%. The model is too small to saturate the GPU. This is CPU-bound training. Increasing batch_size or network size would increase GPU utilization.
-
 ### Main loop and UTD
-**CRITICAL**: The main loop must maintain UTD (Updates-to-Data ratio) ≈ 1.0 to match pre-Phase-2 learning quality. This is achieved by:
-1. Queue capped at 512 items → actors block on `put()` when full (backpressure)
-2. Proportional learning: N `learn()` calls per batch of N transitions
-3. No intermediate buffer (drainer removed) — direct queue access preserves backpressure
-
-The learning debt system and TransitionDrainer both broke this by removing backpressure. They are kept as dead code but NOT used.
-
-### Actor transition batching
-Actors accumulate transitions locally and flush at 32 or on episode done (`_ACTOR_BATCH=32`). Queue items are tuples of 5 numpy arrays. Main loop calls `add_batch()` once per queue item.
+**CRITICAL**: The main loop must maintain UTD (Updates-to-Data ratio) ≈ 1.0. This is achieved by:
+1. Config-driven queue size → actors block on `put()` when full (backpressure)
+2. Proportional learning: N `learn()` calls per N transitions drained
+3. Direct queue access — no intermediate buffer/drainer
 
 ### np.random.randint
 Does NOT support `out=` parameter (unlike np.random.default_rng().integers()). This caused a silent learner crash in the past.
@@ -195,4 +182,4 @@ action_repeat models DECISION FREQUENCY (8Hz LiDAR rate). delay_steps models PIP
 ### Sensor delays
 Per-episode base delay sampled in reset(), with ±1 frame jitter per step. This models real hardware where delay is determined by wiring/buffering and stays approximately constant within a run.
 
-Last updated: 2026-02-21
+Last updated: 2026-02-22
