@@ -2,7 +2,7 @@ vehicle:
   acceleration: 2.0
   brake_deceleration: 3.5
   reverse_acceleration: 1.5
-  max_speed: 8.0
+  max_speed: 4.0
   max_reverse_speed: 0.5
   friction: 0.6
   drag: 0.2

@@ -174,6 +174,14 @@ Numbered configs for the SSAC trainer with varying scale:
 - **config_sac_12**: 64 actors, 10 maps, utd_ratio=0.25, batch_size=256
 - **config_sac_13**: Latest iteration with tuned hyperparameters
 
+### Scaling `num_actors`
+
+With a hardcoded `utd_ratio`, fewer actors (e.g. 16 instead of 64) train ~4x slower in wall-clock time but leave the GPU mostly idle — compensate by raising `utd_ratio` proportionally (e.g. 8.0 for 16 actors) to keep the GPU saturated. Fewer actors also turn over the replay buffer 4x slower, which improves data retention across maps but increases off-policy staleness; adjust `sync_every` downward to keep actor weights fresh.
+
+### CPU-only training
+
+Set `device: cpu` and drop `num_actors` to ~4 so the learner has enough cores for `learn()` calls, which are ~20-50x slower without GPU tensor parallelism. Lower `utd_ratio` to 0.25-0.5 (or shrink `batch_size` to 64) to keep the main loop from falling behind actors — on CPU the learner is the bottleneck, not data collection.
+
 ### Domain Randomization Categories
 
 Configured in `sim_randomization` section of game.yaml or config_sac_N.yaml:

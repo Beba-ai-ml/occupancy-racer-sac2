@@ -82,7 +82,15 @@ class QNetwork(nn.Module):
         hidden_sizes = list(hidden_sizes)
         if not hidden_sizes:
             hidden_sizes = [128, 128]
-        self.net = _build_mlp(state_dim + action_dim, hidden_sizes, 1)
+        layers: list[nn.Module] = []
+        last_dim = state_dim + action_dim
+        for size in hidden_sizes:
+            layers.append(nn.Linear(last_dim, size))
+            layers.append(nn.LayerNorm(size))
+            layers.append(nn.ReLU())
+            last_dim = size
+        layers.append(nn.Linear(last_dim, 1))
+        self.net = nn.Sequential(*layers)
 
     def forward(self, state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
         x = torch.cat([state, action], dim=-1)
@@ -99,6 +107,12 @@ class ReplayBuffer:
         self.rewards = np.zeros(self.capacity, dtype=np.float32)
         self.next_states = np.zeros((self.capacity, state_dim), dtype=np.float32)
         self.dones = np.zeros(self.capacity, dtype=np.float32)
+        self.map_ids = np.full(self.capacity, -1, dtype=np.int32)
+        self._rng = np.random.default_rng()
+        # Stratified sampling cache
+        self._cached_map_indices: dict[int, np.ndarray] | None = None
+        self._cache_add_count = 0
+        self._cache_rebuild_every = 1000
 
     def add(
         self,
@@ -107,19 +121,59 @@ class ReplayBuffer:
         reward: float,
         next_state: np.ndarray,
         done: bool,
+        map_id: int = -1,
     ) -> None:
         self.states[self.ptr] = state
         self.actions[self.ptr] = action
         self.rewards[self.ptr] = reward
         self.next_states[self.ptr] = next_state
         self.dones[self.ptr] = float(done)
+        self.map_ids[self.ptr] = map_id
         self.ptr = (self.ptr + 1) % self.capacity
         self.size = min(self.size + 1, self.capacity)
+        self._cache_add_count += 1
+        if self._cache_add_count >= self._cache_rebuild_every or (
+            self.size == self.capacity and self._cached_map_indices is not None
+        ):
+            self._cached_map_indices = None
+
+    def _build_map_index_cache(self) -> dict[int, np.ndarray]:
+        ids = self.map_ids[:self.size]
+        unique_maps = np.unique(ids[ids >= 0])
+        cache: dict[int, np.ndarray] = {}
+        for mid in unique_maps:
+            cache[int(mid)] = np.where(ids == mid)[0]
+        return cache
+
+    def _stratified_indices(self, batch_size: int) -> np.ndarray:
+        if self._cached_map_indices is None:
+            self._cached_map_indices = self._build_map_index_cache()
+            self._cache_add_count = 0
+        cache = self._cached_map_indices
+        if len(cache) < 2:
+            return self._rng.integers(0, self.size, size=batch_size)
+        map_ids_list = list(cache.keys())
+        self._rng.shuffle(map_ids_list)
+        n_maps = len(map_ids_list)
+        per_map = batch_size // n_maps
+        remainder = batch_size - per_map * n_maps
+        parts: list[np.ndarray] = []
+        for i, mid in enumerate(map_ids_list):
+            indices = cache[mid]
+            count = per_map + (1 if i < remainder else 0)
+            sampled = self._rng.choice(indices, size=count, replace=True)
+            parts.append(sampled)
+        idx = np.concatenate(parts)
+        self._rng.shuffle(idx)
+        return idx
 
     def sample(
-        self, batch_size: int
+        self, batch_size: int, stratified: bool = False,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        idx = np.random.randint(0, self.size, size=batch_size)
+        if stratified:
+            idx = self._stratified_indices(batch_size)
+        else:
+            idx = self._rng.integers(0, self.size, size=batch_size)
         return (
             self.states[idx],
             self.actions[idx],
@@ -127,6 +181,19 @@ class ReplayBuffer:
             self.next_states[idx],
             self.dones[idx],
         )
+
+    def sample_into(self, batch_size: int, np_s: np.ndarray, np_a: np.ndarray,
+                     np_r: np.ndarray, np_ns: np.ndarray, np_d: np.ndarray,
+                     stratified: bool = False) -> None:
+        if stratified:
+            idx = self._stratified_indices(batch_size)
+        else:
+            idx = self._rng.integers(0, self.size, size=batch_size)
+        np.take(self.states, idx, axis=0, out=np_s)
+        np.take(self.actions, idx, axis=0, out=np_a)
+        np.take(self.rewards, idx, axis=0, out=np_r)
+        np.take(self.next_states, idx, axis=0, out=np_ns)
+        np.take(self.dones, idx, axis=0, out=np_d)
 
     def to_list(self) -> list[Tuple[np.ndarray, np.ndarray, float, np.ndarray, float]]:
         return [
@@ -176,6 +243,7 @@ class SACAgent:
         hidden_sizes: Iterable[int],
         grad_clip: float = 0.0,
         alpha_min: float = 0.0,
+        alpha_max: float = 0.0,
         device: str | None = None,
     ) -> None:
         self.action_dim = action_dim
@@ -188,6 +256,7 @@ class SACAgent:
         self.updates_per_step = max(1, int(updates_per_step))
         self.grad_clip = float(grad_clip)
         self.alpha_min = float(alpha_min)
+        self.alpha_max = float(alpha_max)
         self.total_steps = 0
         self.total_updates = 0
         self.last_loss: float | None = None
@@ -250,7 +319,22 @@ class SACAgent:
         )
         self.alpha_optimizer = optim.Adam([self.log_alpha], lr=float(alpha_lr))
 
+        self._critic_params = list(self.critic1.parameters()) + list(self.critic2.parameters())
+
         self.memory = ReplayBuffer(memory_size, state_dim, action_dim)
+
+        if self.device.type == "cuda":
+            bs = self.batch_size
+            self._pin_states = torch.empty(bs, state_dim, dtype=torch.float32).pin_memory()
+            self._pin_actions = torch.empty(bs, action_dim, dtype=torch.float32).pin_memory()
+            self._pin_rewards = torch.empty(bs, 1, dtype=torch.float32).pin_memory()
+            self._pin_next_states = torch.empty(bs, state_dim, dtype=torch.float32).pin_memory()
+            self._pin_dones = torch.empty(bs, 1, dtype=torch.float32).pin_memory()
+            self._np_states = self._pin_states.numpy()
+            self._np_actions = self._pin_actions.numpy()
+            self._np_rewards = self._pin_rewards.squeeze(1).numpy()
+            self._np_next_states = self._pin_next_states.numpy()
+            self._np_dones = self._pin_dones.squeeze(1).numpy()
 
     @property
     def alpha(self) -> torch.Tensor:
@@ -291,9 +375,10 @@ class SACAgent:
         reward: float,
         next_state: np.ndarray,
         done: bool,
+        map_id: int = -1,
     ) -> None:
         self.total_steps += 1
-        self.memory.add(state, action, reward, next_state, done)
+        self.memory.add(state, action, reward, next_state, done, map_id)
         if len(self.memory) < self.batch_size or self.total_steps < self.learn_after:
             self.last_loss = None
             return
@@ -302,15 +387,21 @@ class SACAgent:
         for _ in range(self.updates_per_step):
             self.last_loss = self.learn()
 
-    def learn(self) -> float:
-        states, actions, rewards, next_states, dones = self.memory.sample(self.batch_size)
+    def learn(self, stratified: bool = False) -> float:
         if self.device.type == "cuda":
-            states_t = torch.from_numpy(states).pin_memory().to(self.device, non_blocking=True)
-            actions_t = torch.from_numpy(actions).pin_memory().to(self.device, non_blocking=True)
-            rewards_t = torch.from_numpy(rewards).pin_memory().to(self.device, non_blocking=True).unsqueeze(1)
-            next_states_t = torch.from_numpy(next_states).pin_memory().to(self.device, non_blocking=True)
-            dones_t = torch.from_numpy(dones).pin_memory().to(self.device, non_blocking=True).unsqueeze(1)
+            self.memory.sample_into(
+                self.batch_size,
+                self._np_states, self._np_actions, self._np_rewards,
+                self._np_next_states, self._np_dones,
+                stratified=stratified,
+            )
+            states_t = self._pin_states.to(self.device, non_blocking=True)
+            actions_t = self._pin_actions.to(self.device, non_blocking=True)
+            rewards_t = self._pin_rewards.to(self.device, non_blocking=True)
+            next_states_t = self._pin_next_states.to(self.device, non_blocking=True)
+            dones_t = self._pin_dones.to(self.device, non_blocking=True)
         else:
+            states, actions, rewards, next_states, dones = self.memory.sample(self.batch_size, stratified=stratified)
             states_t = torch.from_numpy(states)
             actions_t = torch.from_numpy(actions)
             rewards_t = torch.from_numpy(rewards).unsqueeze(1)
@@ -335,7 +426,7 @@ class SACAgent:
         q_loss.backward()
         if self.grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(
-                list(self.critic1.parameters()) + list(self.critic2.parameters()),
+                self._critic_params,
                 self.grad_clip,
             )
         self.critic_optimizer.step()
@@ -362,6 +453,10 @@ class SACAgent:
                 min_log_alpha = float(np.log(max(self.alpha_min, 1e-10)))
                 with torch.no_grad():
                     self.log_alpha.data.clamp_(min=min_log_alpha)
+            if self.alpha_max > 0 and self.log_alpha is not None:
+                max_log_alpha = float(np.log(max(self.alpha_max, 1e-10)))
+                with torch.no_grad():
+                    self.log_alpha.data.clamp_(max=max_log_alpha)
 
         self._soft_update(self.critic1_target, self.critic1)
         self._soft_update(self.critic2_target, self.critic2)
@@ -376,8 +471,8 @@ class SACAgent:
     def _soft_update(self, target: nn.Module, source: nn.Module) -> None:
         tau = self.tau
         with torch.no_grad():
-            for target_param, param in zip(target.parameters(), source.parameters()):
-                target_param.data.copy_(tau * param.data + (1.0 - tau) * target_param.data)
+            for t, s in zip(target.parameters(), source.parameters()):
+                t.data.mul_(1.0 - tau).add_(s.data, alpha=tau)
 
     def save_checkpoint(self, path: str, meta: dict | None = None) -> None:
         def _clean_sd(sd: dict) -> dict:

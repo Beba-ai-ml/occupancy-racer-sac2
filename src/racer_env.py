@@ -20,8 +20,8 @@ LIDAR_SPARSE_STEP_DEG = 15.0
 LIDAR_FRONT_CONE_DEG = 20.0
 
 
-def _build_lidar_angles() -> list[float]:
-    # Dense rays near the front, sparser on the sides, keeping a 210° total arc.
+def _build_legacy_lidar_angles() -> list[float]:
+    """Classic 27-ray layout: dense front ±45°, sparse sides, 210° arc."""
     center = int(LIDAR_CENTER_DEG)
     arc_half = int(LIDAR_TOTAL_ARC_DEG / 2)
     dense_half = int(LIDAR_DENSE_HALF_DEG)
@@ -39,7 +39,33 @@ def _build_lidar_angles() -> list[float]:
     return [float(a) for a in angles]
 
 
-LIDAR_ANGLES_DEG = _build_lidar_angles()
+def build_lidar_angles(front_step_deg: float, rear_step_deg: float) -> list[float]:
+    """Build full 360° LiDAR with configurable front/rear density.
+
+    Front hemisphere (0°–180°, centered on 90°=forward): ``front_step_deg`` spacing.
+    Rear hemisphere (180°–360°): ``rear_step_deg`` spacing.
+    """
+    center = LIDAR_CENTER_DEG  # 90° = forward
+
+    # Front hemisphere: 0° to 180° (inclusive on both ends)
+    front_start = center - 90.0  # 0°
+    front_end = center + 90.0    # 180°
+    n_front = int(round((front_end - front_start) / front_step_deg)) + 1
+    front_angles = [front_start + i * front_step_deg for i in range(n_front)]
+
+    # Rear hemisphere: 180°+step to 360°-step (exclude boundaries already covered / wrap point)
+    rear_start = front_end + rear_step_deg  # first rear angle after 180°
+    rear_end = front_start + 360.0 - rear_step_deg  # last rear angle before 360°(=0°)
+    rear_angles = []
+    a = rear_start
+    while a <= rear_end + 1e-9:
+        rear_angles.append(a)
+        a += rear_step_deg
+
+    return front_angles + rear_angles
+
+
+LIDAR_ANGLES_DEG = _build_legacy_lidar_angles()
 LIDAR_MAX_RANGE_M = 20.0
 
 
@@ -48,6 +74,7 @@ def create_map_surface(
     kill_mask: np.ndarray | None = None,
     spawn_mask: np.ndarray | None = None,
     lookat_mask: np.ndarray | None = None,
+    raceline_mask: np.ndarray | None = None,
 ) -> pygame.Surface:
     if image.ndim != 2:
         raise ValueError("Map image must be a 2D array")
@@ -64,6 +91,10 @@ def create_map_surface(
         rgb[lookat_mask, 0] = np.minimum(rgb[lookat_mask, 0].astype(np.int16) + 140, 255).astype(np.uint8)
         rgb[lookat_mask, 1] = np.minimum(rgb[lookat_mask, 1].astype(np.int16) + 140, 255).astype(np.uint8)
         rgb[lookat_mask, 2] = (rgb[lookat_mask, 2] * 0.3).astype(np.uint8)
+    if raceline_mask is not None:
+        rgb[raceline_mask, 0] = np.minimum(rgb[raceline_mask, 0].astype(np.int16) + 120, 255).astype(np.uint8)
+        rgb[raceline_mask, 1] = (rgb[raceline_mask, 1] * 0.3).astype(np.uint8)
+        rgb[raceline_mask, 2] = np.minimum(rgb[raceline_mask, 2].astype(np.int16) + 160, 255).astype(np.uint8)
     surface = pygame.surfarray.make_surface(rgb.swapaxes(0, 1))
     return surface
 
@@ -113,7 +144,14 @@ class RacerEnv:
             (self.map_width * map_data.resolution) / 2.0,
             (self.map_height * map_data.resolution) / 2.0,
         )
-        self.lidar_angles_deg = list(LIDAR_ANGLES_DEG)
+        lidar_cfg = self.sim_cfg.get("lidar", {})
+        if "front_step_deg" in lidar_cfg:
+            self.lidar_angles_deg = build_lidar_angles(
+                float(lidar_cfg["front_step_deg"]),
+                float(lidar_cfg.get("rear_step_deg", 2.0)),
+            )
+        else:
+            self.lidar_angles_deg = list(LIDAR_ANGLES_DEG)  # legacy 27-ray
         self.lidar_offsets = [math.radians(90.0 - angle) for angle in self.lidar_angles_deg]
         self.lidar_max_range_m = float(LIDAR_MAX_RANGE_M)
 
@@ -191,6 +229,36 @@ class RacerEnv:
         else:
             self.lookat_positions = None
 
+        # Per-zone spawn and lookat positions (zone_id -> np.ndarray of [y,x])
+        self._spawn_by_zone: dict[int, np.ndarray] = {}
+        self._lookat_by_zone: dict[int, np.ndarray] = {}
+        self._zone_ids: list[int] = []
+        if map_data.spawn_zones is not None:
+            for zid in (1, 2, 3):
+                zone_mask = map_data.spawn_zones == zid
+                positions = np.argwhere(base_free & zone_mask)
+                if positions.size > 0:
+                    self._spawn_by_zone[zid] = positions
+            if self._spawn_by_zone:
+                self._zone_ids = sorted(self._spawn_by_zone.keys())
+        if map_data.lookat_zones is not None:
+            for zid in (1, 2, 3):
+                zone_mask = map_data.lookat_zones == zid
+                positions = np.argwhere(zone_mask)
+                if positions.size > 0:
+                    self._lookat_by_zone[zid] = positions
+        # Warn if any spawn zone has no matching lookat zone
+        if self._zone_ids and self._lookat_by_zone:
+            for zid in self._zone_ids:
+                if zid not in self._lookat_by_zone:
+                    print(f"WARNING: spawn zone {zid} has no matching lookat zone, will use clockwise heading")
+        # Backward compat: if spawn_mask exists but no zone_ids, put everything into zone 1
+        if not self._zone_ids and map_data.spawn_mask is not None:
+            self._spawn_by_zone[1] = self.spawn_positions.copy()
+            self._zone_ids = [1]
+            if self.lookat_positions is not None:
+                self._lookat_by_zone[1] = self.lookat_positions
+
         # Pre-filter spawn positions by wall clearance so _random_spawn() can
         # skip all raycasting.  Only done when a spawn_mask restricts the set
         # and the candidate count is manageable.
@@ -209,6 +277,22 @@ class RacerEnv:
                 self._spawn_prefiltered = True
             # If all filtered out: keep unfiltered, _spawn_prefiltered stays False
 
+        # Pre-filter per-zone spawn positions by wall clearance
+        self._spawn_by_zone_prefiltered: dict[int, np.ndarray] = {}
+        if self._zone_ids:
+            res = map_data.resolution
+            clearance = self.spawn_clearance_m
+            for zid, positions in self._spawn_by_zone.items():
+                if len(positions) <= 50000:
+                    keep = []
+                    for i in range(len(positions)):
+                        y, x = positions[i]
+                        origin = pygame.Vector2((float(x) + 0.5) * res, (float(y) + 0.5) * res)
+                        if self._min_wall_distance(origin) >= clearance:
+                            keep.append(i)
+                    if keep:
+                        self._spawn_by_zone_prefiltered[zid] = positions[np.array(keep)]
+
         track_cfg = self.sim_cfg.get("track", {})
         self.track_center_mode = str(track_cfg.get("center", "map")).lower()
         direction = str(track_cfg.get("direction", "clockwise")).lower()
@@ -220,6 +304,12 @@ class RacerEnv:
                 (float(mean_yx[1]) + 0.5) * map_data.resolution,
                 (float(mean_yx[0]) + 0.5) * map_data.resolution,
             )
+
+        # Raceline waypoints for heading guidance on open maps
+        self._raceline_waypoints: np.ndarray | None = None
+        self._raceline_is_loop = False
+        if map_data.raceline_mask is not None:
+            self._build_raceline_waypoints(map_data.raceline_mask, map_data.resolution)
 
         self.render_requested = bool(render)
         self.render_enabled = bool(render)
@@ -977,7 +1067,89 @@ class RacerEnv:
         self.stuck_time = 0.0
         return 0.0
 
+    def _build_raceline_waypoints(self, mask: np.ndarray, resolution: float) -> None:
+        """Build ordered waypoints from a painted raceline mask using double-BFS."""
+        h, w = mask.shape
+        rl_pixels = np.argwhere(mask)
+        if len(rl_pixels) < 2:
+            return
+
+        NEIGHBORS = [(-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)]
+
+        # BFS 1: from arbitrary pixel to find one true endpoint
+        start_y, start_x = int(rl_pixels[0, 0]), int(rl_pixels[0, 1])
+        visited = np.full((h, w), -1, dtype=np.int32)
+        visited[start_y, start_x] = 0
+        queue = deque([(start_y, start_x)])
+        farthest = (start_y, start_x)
+        max_dist = 0
+        while queue:
+            y, x = queue.popleft()
+            d = visited[y, x]
+            for dy, dx in NEIGHBORS:
+                ny, nx = y + dy, x + dx
+                if 0 <= ny < h and 0 <= nx < w and visited[ny, nx] < 0 and mask[ny, nx]:
+                    visited[ny, nx] = d + 1
+                    queue.append((ny, nx))
+                    if d + 1 > max_dist:
+                        max_dist = d + 1
+                        farthest = (ny, nx)
+
+        # BFS 2: from true endpoint to get progress ordering
+        ep_y, ep_x = farthest
+        progress = np.full((h, w), -1, dtype=np.int32)
+        progress[ep_y, ep_x] = 0
+        queue = deque([(ep_y, ep_x)])
+        max_dist2 = 0
+        far2 = (ep_y, ep_x)
+        while queue:
+            y, x = queue.popleft()
+            d = progress[y, x]
+            for dy, dx in NEIGHBORS:
+                ny, nx = y + dy, x + dx
+                if 0 <= ny < h and 0 <= nx < w and progress[ny, nx] < 0 and mask[ny, nx]:
+                    progress[ny, nx] = d + 1
+                    queue.append((ny, nx))
+                    if d + 1 > max_dist2:
+                        max_dist2 = d + 1
+                        far2 = (ny, nx)
+
+        if max_dist2 < 2:
+            return
+
+        # Extract centroid at each distance level → ordered waypoints
+        step = max(1, max_dist2 // 300)
+        waypoints = []
+        for d in range(0, max_dist2 + 1, step):
+            pixels_d = np.argwhere(progress == d)
+            if len(pixels_d) == 0:
+                continue
+            cy = float(pixels_d[:, 0].mean())
+            cx = float(pixels_d[:, 1].mean())
+            waypoints.append(((cx + 0.5) * resolution, (cy + 0.5) * resolution))
+
+        if len(waypoints) < 2:
+            return
+
+        self._raceline_waypoints = np.array(waypoints, dtype=np.float32)
+        # Detect loop: start and end close together
+        dist_se = np.linalg.norm(self._raceline_waypoints[-1] - self._raceline_waypoints[0])
+        self._raceline_is_loop = dist_se < 5.0 * resolution * step
+        print(f"Raceline: {len(waypoints)} waypoints, loop={self._raceline_is_loop}")
+
     def _clockwise_heading(self, position: pygame.Vector2) -> float:
+        if self._raceline_waypoints is not None:
+            pos = np.array([position.x, position.y], dtype=np.float32)
+            dists_sq = np.sum((self._raceline_waypoints - pos) ** 2, axis=1)
+            idx = int(np.argmin(dists_sq))
+            if self._raceline_is_loop:
+                next_idx = (idx + 1) % len(self._raceline_waypoints)
+            else:
+                next_idx = min(idx + 1, len(self._raceline_waypoints) - 1)
+            d = self._raceline_waypoints[next_idx] - self._raceline_waypoints[idx]
+            if d[0] ** 2 + d[1] ** 2 < 1e-12:
+                return 0.0
+            return math.atan2(float(d[1]), float(d[0]))
         radial = position - self.map_center
         if radial.length_squared() < 1e-6:
             return 0.0
@@ -1001,19 +1173,91 @@ class RacerEnv:
     def _is_clockwise_motion(self) -> bool:
         return self._clockwise_alignment() > 0.0
 
+    def _lookat_angle_from(self, origin: pygame.Vector2, lookat_positions: np.ndarray) -> float | None:
+        """Pick a random look-at target pixel and return the angle from origin to it.
+
+        Returns None if no valid (non-colocated) target found after retries.
+        """
+        res = self.map_data.resolution
+        for _ in range(min(5, len(lookat_positions))):
+            idx = np.random.randint(0, len(lookat_positions))
+            ty, tx = lookat_positions[idx]
+            target = pygame.Vector2((float(tx) + 0.5) * res, (float(ty) + 0.5) * res)
+            diff = target - origin
+            if diff.length_squared() >= 1e-6:
+                return math.atan2(diff.y, diff.x)
+        return None
+
     def _lookat_angle(self, origin: pygame.Vector2) -> float:
         """Pick a random look-at target pixel and return the angle from origin to it."""
-        res = self.map_data.resolution
-        idx = np.random.randint(0, len(self.lookat_positions))
-        ty, tx = self.lookat_positions[idx]
-        target = pygame.Vector2((float(tx) + 0.5) * res, (float(ty) + 0.5) * res)
-        diff = target - origin
-        if diff.length_squared() < 1e-6:
-            return 0.0
-        return math.atan2(diff.y, diff.x)
+        if self.lookat_positions is None:
+            return self._clockwise_heading(origin)
+        angle = self._lookat_angle_from(origin, self.lookat_positions)
+        return angle if angle is not None else self._clockwise_heading(origin)
 
     def _random_spawn(self, min_clearance_m: float) -> Tuple[Tuple[float, float], float]:
         res = self.map_data.resolution
+
+        # Zone-aware path: pick a random zone, use zone-specific positions + lookat
+        if self._zone_ids:
+            zone_id = self._zone_ids[np.random.randint(0, len(self._zone_ids))]
+            zone_lookat = self._lookat_by_zone.get(zone_id)
+            use_lookat = zone_lookat is not None and len(zone_lookat) > 0
+
+            # Fast path: pre-filtered positions for this zone
+            if zone_id in self._spawn_by_zone_prefiltered:
+                positions = self._spawn_by_zone_prefiltered[zone_id]
+                idx = np.random.randint(0, len(positions))
+                y, x = positions[idx]
+                origin = pygame.Vector2((float(x) + 0.5) * res, (float(y) + 0.5) * res)
+                if use_lookat:
+                    angle = self._lookat_angle_from(origin, zone_lookat)
+                    if angle is None:
+                        angle = self._clockwise_heading(origin)
+                else:
+                    angle = self._clockwise_heading(origin)
+                return (origin.x, origin.y), angle
+
+            # Slow path with raycasting
+            positions = self._spawn_by_zone[zone_id]
+            attempts = min(1000, len(positions))
+            for _ in range(attempts):
+                idx = np.random.randint(0, len(positions))
+                y, x = positions[idx]
+                origin = pygame.Vector2((float(x) + 0.5) * res, (float(y) + 0.5) * res)
+                if self._min_wall_distance(origin) < self.spawn_wall_clearance_m:
+                    continue
+                if use_lookat:
+                    angle = self._lookat_angle_from(origin, zone_lookat)
+                    if angle is None:
+                        angle = self._clockwise_heading(origin)
+                    # With lookat, check radial clearance (not directional)
+                    if self._min_wall_distance(origin) >= min_clearance_m:
+                        return (origin.x, origin.y), angle
+                else:
+                    angle = self._clockwise_heading(origin)
+                    distance_m, _ = self._cast_ray(origin, angle)
+                    if self.spawn_face_forward:
+                        back_dist, _ = self._cast_ray(origin, angle + math.pi)
+                        if distance_m < min_clearance_m and back_dist >= min_clearance_m:
+                            angle = (angle + math.pi) % (2.0 * math.pi)
+                            distance_m = back_dist
+                    if distance_m >= min_clearance_m:
+                        return (origin.x, origin.y), angle
+
+            # Fallback: random position from the zone
+            idx = np.random.randint(0, len(positions))
+            y, x = positions[idx]
+            origin = pygame.Vector2((float(x) + 0.5) * res, (float(y) + 0.5) * res)
+            if use_lookat:
+                angle = self._lookat_angle_from(origin, zone_lookat)
+                if angle is None:
+                    angle = self._clockwise_heading(origin)
+            else:
+                angle = self._clockwise_heading(origin)
+            return (origin.x, origin.y), angle
+
+        # Legacy path: no zones
         use_lookat = self.lookat_positions is not None
 
         # Fast path: pre-filtered positions have guaranteed clearance
@@ -1382,6 +1626,10 @@ class RacerEnv:
             dist = min(distance_m / self.lidar_max_range_m, 1.0)
             distances.append(dist)
             delta = angle_deg - LIDAR_CENTER_DEG
+            # Only use forward hemisphere (0°–180°) for front/left/right split
+            # to avoid rear rays creating asymmetry in balance penalty.
+            if angle_deg > 180.0:
+                continue
             if abs(delta) <= self.reward_front_cone_deg:
                 front_distances.append(dist)
             elif delta < 0:
@@ -1404,10 +1652,11 @@ class RacerEnv:
         side_clear = 0.5 * (left + right)
 
         if self.distance_progress_enabled:
-            # S9: Distance progress reward (replaces alignment-based reward)
+            # S9: Distance progress reward — project onto track heading (not vehicle heading)
             delta_pos = self.vehicle.position - self.prev_position
-            heading = pygame.Vector2(math.cos(self.vehicle.angle), math.sin(self.vehicle.angle))
-            forward_progress = delta_pos.dot(heading)
+            tangent_angle = self._clockwise_heading(self.vehicle.position)
+            heading = pygame.Vector2(math.cos(tangent_angle), math.sin(tangent_angle))
+            forward_progress = max(0.0, delta_pos.dot(heading))
             reward_forward = (
                 self.reward_forward_speed_weight * forward_speed_norm
                 + self.reward_front_speed_weight * forward_speed_norm * front
@@ -1646,6 +1895,7 @@ class RacerEnv:
             kill_mask=self.map_data.kill_mask,
             spawn_mask=self.map_data.spawn_mask,
             lookat_mask=self.map_data.lookat_mask,
+            raceline_mask=self.map_data.raceline_mask,
         )
         self._update_scaled_map_surface()
         window_size = (self.map_width, self.map_height)

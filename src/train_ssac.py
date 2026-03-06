@@ -15,6 +15,7 @@ except ImportError:
     resource = None  # not available on Windows
 import shutil
 import sys
+import threading
 from typing import List
 
 import numpy as np
@@ -24,7 +25,7 @@ torch.set_float32_matmul_precision('high')
 from .config import load_yaml, resolve_path
 from .map_loader import load_map
 from .params import build_map_params, build_vehicle_params
-from .racer_env import LIDAR_ANGLES_DEG, RacerEnv
+from .racer_env import build_lidar_angles, RacerEnv
 from .rl_agent import SACAgent, GaussianPolicy
 from .sim_config import build_sim_config, register_sim_args
 
@@ -33,6 +34,39 @@ def _mean(values: List[float]) -> float:
     if not values:
         return 0.0
     return float(sum(values) / len(values))
+
+
+class LogBuffer:
+    def __init__(self, path: str, fieldnames: list[str]) -> None:
+        self._queue: queue_mod.Queue = queue_mod.Queue()  # unbounded to prevent deadlock
+        self._path = path
+        self._fieldnames = fieldnames
+        self._thread = threading.Thread(target=self._writer, daemon=True)
+        self._thread.start()
+
+    def _writer(self) -> None:
+        header_written = os.path.exists(self._path) and os.path.getsize(self._path) > 0
+        while True:
+            try:
+                row = self._queue.get()
+                if row is None:
+                    break
+                with open(self._path, "a", newline="", encoding="utf-8") as f:
+                    w = csv.DictWriter(f, fieldnames=self._fieldnames)
+                    if not header_written:
+                        w.writeheader()
+                        header_written = True
+                    w.writerow(row)
+                    f.flush()
+            except Exception as e:
+                print(f"LogBuffer writer error: {e}", flush=True)
+
+    def write(self, row: dict) -> None:
+        self._queue.put_nowait(row)
+
+    def shutdown(self) -> None:
+        self._queue.put(None)
+        self._thread.join(timeout=5)
 
 
 def _cpu_state_dict(model: torch.nn.Module) -> dict:
@@ -217,6 +251,8 @@ def _actor_worker(
             sim_cfg=sim_cfg,
         )
 
+    _map_name_to_id = {p: i for i, p in enumerate(map_pool)} if map_pool else {}
+
     current_map_path = map_path
     map_block_remaining = 0
     if map_pool and map_switch_every > 0 and map_switch_start_episode <= 0:
@@ -310,7 +346,8 @@ def _actor_worker(
         # Transition uses decision-point obs, accumulated reward over all
         # repeat frames, and the observation at window end.
         if done or env.wants_new_action:
-            transition_queue.put((decision_obs, action, accumulated_reward, next_obs, float(done)))
+            map_id = _map_name_to_id.get(current_map_path, -1)
+            transition_queue.put((decision_obs, action, accumulated_reward, next_obs, float(done), map_id))
 
         episode_reward += reward
         if reward < 0:
@@ -516,6 +553,8 @@ def train_ssac() -> None:
     parser.add_argument("--stack-frames", type=int, default=None, help="Number of frames to stack")
     parser.add_argument("--sync-every", type=int, default=None, help="Sync actor weights every N transitions")
     parser.add_argument("--queue-size", type=int, default=None, help="Max transitions in queue")
+    parser.add_argument("--render", action="store_true", default=False,
+                        help="Shortcut: enable render for actor 0 every episode (sets render-actor=0, render-every=1)")
     parser.add_argument("--render-actor", type=int, default=None, help="Actor id to render (optional)")
     parser.add_argument("--render-every", type=int, default=None, help="Render every N episodes for render actor")
     parser.add_argument("--gamma", type=float, default=None, help="Discount factor")
@@ -534,8 +573,15 @@ def train_ssac() -> None:
     parser.add_argument("--hidden-sizes", default=None, help="Comma-separated hidden layer sizes")
     parser.add_argument("--grad-clip", type=float, default=None, help="Gradient norm clipping (0=disabled)")
     parser.add_argument("--alpha-min", type=float, default=None, help="Minimum alpha floor")
+    parser.add_argument("--alpha-max", type=float, default=None, help="Maximum alpha ceiling (0=disabled)")
     parser.add_argument("--utd-ratio", type=float, default=None,
                         help="Update-to-data ratio (default from config or 1.0)")
+    parser.add_argument("--lidar-front-step-deg", type=float, default=None,
+                        help="LiDAR angular step for front hemisphere (0-180 deg), default 5.0")
+    parser.add_argument("--lidar-rear-step-deg", type=float, default=None,
+                        help="LiDAR angular step for rear hemisphere (180-360 deg), default 15.0")
+    parser.add_argument("--stratified-sampling", action=argparse.BooleanOptionalAction, default=None,
+                        help="Enable stratified replay sampling by map ID")
     register_sim_args(parser)
 
     raw_args = sys.argv[1:]
@@ -586,6 +632,11 @@ def train_ssac() -> None:
     queue_size = int(args.queue_size if args.queue_size is not None else async_cfg.get("queue_size", 5000))
     render_actor = args.render_actor if args.render_actor is not None else async_cfg.get("render_actor")
     render_every = int(args.render_every if args.render_every is not None else async_cfg.get("render_every", 0))
+    if args.render:
+        if render_actor is None:
+            render_actor = 0
+        if render_every <= 0:
+            render_every = 1
 
     steer_bins = list(range(0, 21))
     accel_bins = [float(v) for v in rl_cfg.get("accel_bins", [-2.0, -1.0, 0.0, 1.0, 2.0])]
@@ -598,7 +649,24 @@ def train_ssac() -> None:
     hidden_sizes = _parse_hidden_sizes(args.hidden_sizes, rl_cfg.get("hidden_sizes", [128, 128]))
     target_entropy = _parse_target_entropy(args.target_entropy or rl_cfg.get("target_entropy"), action_dim)
 
-    state_dim = (len(LIDAR_ANGLES_DEG) + 5) * max(1, stack_frames)  # +5: collision, speed, servo, linear_accel, angular_vel
+    # LiDAR configuration — only inject into sim_cfg when explicitly configured
+    lidar_front_step = args.lidar_front_step_deg  # None if not in CLI/YAML
+    lidar_rear_step = args.lidar_rear_step_deg
+    if lidar_front_step is not None:
+        lidar_front_step = float(lidar_front_step)
+        lidar_rear_step = float(lidar_rear_step) if lidar_rear_step is not None else 2.0
+        sim_cfg.setdefault("lidar", {})
+        sim_cfg["lidar"]["front_step_deg"] = lidar_front_step
+        sim_cfg["lidar"]["rear_step_deg"] = lidar_rear_step
+        lidar_angles = build_lidar_angles(lidar_front_step, lidar_rear_step)
+        num_lidar_rays = len(lidar_angles)
+        print(f"LiDAR: {num_lidar_rays} rays (front step={lidar_front_step}°, rear step={lidar_rear_step}°)")
+    else:
+        from .racer_env import LIDAR_ANGLES_DEG
+        num_lidar_rays = len(LIDAR_ANGLES_DEG)
+        print(f"LiDAR: {num_lidar_rays} rays (legacy layout)")
+
+    state_dim = (num_lidar_rays + 5) * max(1, stack_frames)  # +5: collision, speed, servo, linear_accel, angular_vel
     agent = SACAgent(
         state_dim=state_dim,
         action_dim=action_dim,
@@ -620,9 +688,16 @@ def train_ssac() -> None:
         hidden_sizes=hidden_sizes,
         grad_clip=float(args.grad_clip if args.grad_clip is not None else rl_cfg.get("grad_clip", 0.0)),
         alpha_min=float(args.alpha_min if args.alpha_min is not None else rl_cfg.get("alpha_min", 0.0)),
+        alpha_max=float(args.alpha_max if args.alpha_max is not None else rl_cfg.get("alpha_max", 0.0)),
         device=device,
     )
     utd_ratio = float(args.utd_ratio if args.utd_ratio is not None else rl_cfg.get("utd_ratio", 1.0))
+    stratified_sampling = bool(
+        args.stratified_sampling if args.stratified_sampling is not None
+        else rl_cfg.get("stratified_sampling", False)
+    )
+    if stratified_sampling:
+        print("Stratified replay sampling: ENABLED")
     print(f"Using device: {agent.device}")
 
     save_dir = str(args.save_dir or rl_cfg.get("save_dir", "runs"))
@@ -866,16 +941,12 @@ def train_ssac() -> None:
                 row[key] = value
         return row
 
+    log_buffer = LogBuffer(session_csv, csv_fieldnames)
+
     def _write_csv_row(row: dict) -> None:
         nonlocal csv_header_written
-        write_header = not csv_header_written
-        with open(session_csv, "a", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=csv_fieldnames)
-            if write_header:
-                writer.writeheader()
-                csv_header_written = True
-            writer.writerow(row)
-            f.flush()
+        csv_header_written = True
+        log_buffer.write(row)
 
     def _write_config_snapshot() -> None:
         if not csv_supports_config:
@@ -1037,8 +1108,8 @@ def train_ssac() -> None:
                 _drain_stats()
                 continue
 
-            state, action, reward, next_state, done = item
-            agent.memory.add(state, action, reward, next_state, done)
+            state, action, reward, next_state, done, map_id = item
+            agent.memory.add(state, action, reward, next_state, done, map_id)
             agent.total_steps += 1
             transitions += 1
 
@@ -1049,8 +1120,8 @@ def train_ssac() -> None:
                     item = transition_queue.get_nowait()
                 except queue_mod.Empty:
                     break
-                state, action, reward, next_state, done = item
-                agent.memory.add(state, action, reward, next_state, done)
+                state, action, reward, next_state, done, map_id = item
+                agent.memory.add(state, action, reward, next_state, done, map_id)
                 agent.total_steps += 1
                 transitions += 1
                 burst += 1
@@ -1074,7 +1145,7 @@ def train_ssac() -> None:
             if can_learn:
                 num_updates = max(1, round(transitions_received * utd_ratio))
                 for _ in range(num_updates):
-                    agent.last_loss = agent.learn()
+                    agent.last_loss = agent.learn(stratified=stratified_sampling)
 
             # --- Drain episode stats ---
             _drain_stats()
@@ -1090,6 +1161,7 @@ def train_ssac() -> None:
                         wq.put(new_weights)
 
     finally:
+        log_buffer.shutdown()
         stop_event.set()
         for proc in processes:
             proc.join(timeout=1.0)

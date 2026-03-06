@@ -6,4 +6,4 @@ Async SAC reinforcement learning agent that trains in simulation (occupancy grid
 - `KNOWLEDGE.md` - Architecture, key files, stack, conventions, how to run
 - `STATE.md` - Current state, recent changes, decisions, known issues
 
-Last updated: 2026-02-22 (Phase 1/2 revert, config tuning)
+Last updated: 2026-03-05 (Configurable 360° LiDAR: 450 rays, scaled network, reviewed by 2 Opus critics x2 rounds)

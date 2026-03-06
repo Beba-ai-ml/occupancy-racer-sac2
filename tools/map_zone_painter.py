@@ -9,6 +9,7 @@ Controls:
     Ctrl+LMB drag       Pan the map (alternative)
     LMB drag            Paint active layer
     RMB drag            Erase from active layer
+    Eraser mode + LMB   Erase from ALL layers at once
     Ctrl+Z              Undo
 """
 from __future__ import annotations
@@ -24,7 +25,7 @@ from PIL import Image, ImageTk
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from src.map_loader import read_pgm  # noqa: E402
+from src.map_loader import read_pgm, decode_zone_channel, encode_zone_channel  # noqa: E402
 
 BG_COLOR = "#cdcdcd"
 ZOOM_MIN = 0.2
@@ -46,6 +47,7 @@ class ZonePainter:
         self.spawn_layer: np.ndarray | None = None
         self.kill_layer: np.ndarray | None = None
         self.lookat_layer: np.ndarray | None = None
+        self.raceline_layer: np.ndarray | None = None
 
         # Viewport
         self.zoom = 1.0
@@ -60,9 +62,11 @@ class ZonePainter:
 
         self.brush_size = 4  # radius in map pixels
         self.mode = tk.StringVar(value="kill")
+        self.zone_id = tk.IntVar(value=1)
         self.show_kill = tk.BooleanVar(value=True)
         self.show_spawn = tk.BooleanVar(value=True)
         self.show_lookat = tk.BooleanVar(value=True)
+        self.show_raceline = tk.BooleanVar(value=True)
 
         # Undo
         self._undo_stack: list[tuple[str, np.ndarray]] = []
@@ -95,6 +99,17 @@ class ZonePainter:
                         bg=BG_COLOR, fg="#008800", selectcolor=BG_COLOR).pack(side=tk.LEFT)
         tk.Radiobutton(toolbar, text="LookAt (Yellow)", variable=self.mode, value="lookat",
                         bg=BG_COLOR, fg="#aa8800", selectcolor=BG_COLOR).pack(side=tk.LEFT)
+        tk.Radiobutton(toolbar, text="Raceline (Purple)", variable=self.mode, value="raceline",
+                        bg=BG_COLOR, fg="#8800cc", selectcolor=BG_COLOR).pack(side=tk.LEFT)
+        tk.Radiobutton(toolbar, text="Eraser", variable=self.mode, value="eraser",
+                        bg=BG_COLOR, fg="#666666", selectcolor=BG_COLOR).pack(side=tk.LEFT)
+
+        tk.Frame(toolbar, width=2, bg="gray").pack(side=tk.LEFT, fill=tk.Y, padx=8, pady=2)
+
+        tk.Label(toolbar, text="Zone:", bg=BG_COLOR).pack(side=tk.LEFT)
+        for zid in (1, 2, 3):
+            tk.Radiobutton(toolbar, text=str(zid), variable=self.zone_id, value=zid,
+                            bg=BG_COLOR, selectcolor=BG_COLOR).pack(side=tk.LEFT)
 
         tk.Frame(toolbar, width=2, bg="gray").pack(side=tk.LEFT, fill=tk.Y, padx=8, pady=2)
 
@@ -112,12 +127,15 @@ class ZonePainter:
                         command=self._on_layer_toggle, bg=BG_COLOR, selectcolor=BG_COLOR).pack(side=tk.LEFT)
         tk.Checkbutton(toolbar, text="Show LookAt", variable=self.show_lookat,
                         command=self._on_layer_toggle, bg=BG_COLOR, selectcolor=BG_COLOR).pack(side=tk.LEFT)
+        tk.Checkbutton(toolbar, text="Show Raceline", variable=self.show_raceline,
+                        command=self._on_layer_toggle, bg=BG_COLOR, selectcolor=BG_COLOR).pack(side=tk.LEFT)
 
         tk.Frame(toolbar, width=2, bg="gray").pack(side=tk.LEFT, fill=tk.Y, padx=8, pady=2)
 
         tk.Button(toolbar, text="Clear Kill", command=self._clear_kill).pack(side=tk.LEFT, padx=2)
         tk.Button(toolbar, text="Clear Spawn", command=self._clear_spawn).pack(side=tk.LEFT, padx=2)
         tk.Button(toolbar, text="Clear LookAt", command=self._clear_lookat).pack(side=tk.LEFT, padx=2)
+        tk.Button(toolbar, text="Clear Raceline", command=self._clear_raceline).pack(side=tk.LEFT, padx=2)
         tk.Button(toolbar, text="Fit", command=self._fit_view).pack(side=tk.LEFT, padx=4)
 
         self.canvas = tk.Canvas(self.root, bg="#222222", cursor="none", highlightthickness=0)
@@ -173,20 +191,24 @@ class ZonePainter:
             return
 
         h, w = self.map_image.shape
-        self.spawn_layer = np.zeros((h, w), dtype=bool)
+        self.spawn_layer = np.zeros((h, w), dtype=np.uint8)
         self.kill_layer = np.zeros((h, w), dtype=bool)
-        self.lookat_layer = np.zeros((h, w), dtype=bool)
+        self.lookat_layer = np.zeros((h, w), dtype=np.uint8)
+        self.raceline_layer = np.zeros((h, w), dtype=bool)
         self._undo_stack.clear()
 
         zones_path = self.map_path.with_name(self.map_path.stem + "_zones.png")
         if zones_path.exists():
             try:
-                zones_img = Image.open(zones_path).convert("RGB")
-                zones_arr = np.asarray(zones_img)
+                zones_img = Image.open(zones_path)
+                has_alpha = zones_img.mode == "RGBA"
+                zones_arr = np.asarray(zones_img.convert("RGBA") if has_alpha else zones_img.convert("RGB"))
                 if zones_arr.shape[:2] == (h, w):
                     self.kill_layer = zones_arr[:, :, 0] >= 128
-                    self.spawn_layer = zones_arr[:, :, 1] >= 128
-                    self.lookat_layer = zones_arr[:, :, 2] >= 128
+                    self.spawn_layer = decode_zone_channel(zones_arr[:, :, 1])
+                    self.lookat_layer = decode_zone_channel(zones_arr[:, :, 2])
+                    if has_alpha:
+                        self.raceline_layer = zones_arr[:, :, 3] >= 128
                     self.status.config(text=f"Loaded existing zones from {zones_path.name}")
                 else:
                     self.status.config(text="Zone file shape mismatch, starting fresh")
@@ -208,20 +230,22 @@ class ZonePainter:
         has_kill = bool(np.any(self.kill_layer))
         has_spawn = bool(np.any(self.spawn_layer))
         has_lookat = self.lookat_layer is not None and bool(np.any(self.lookat_layer))
-        if not has_kill and not has_spawn and not has_lookat:
+        has_raceline = self.raceline_layer is not None and bool(np.any(self.raceline_layer))
+        if not has_kill and not has_spawn and not has_lookat and not has_raceline:
             messagebox.showinfo("Empty", "All layers are empty. Nothing to save.")
             return
 
         h, w = self.map_image.shape
-        out = np.zeros((h, w, 3), dtype=np.uint8)
+        out = np.zeros((h, w, 4), dtype=np.uint8)
         out[self.kill_layer, 0] = 255
-        out[self.spawn_layer, 1] = 255
-        if has_lookat:
-            out[self.lookat_layer, 2] = 255
+        out[:, :, 1] = encode_zone_channel(self.spawn_layer)
+        out[:, :, 2] = encode_zone_channel(self.lookat_layer)
+        if has_raceline:
+            out[self.raceline_layer, 3] = 255
 
         zones_path = self.map_path.with_name(self.map_path.stem + "_zones.png")
         try:
-            Image.fromarray(out, "RGB").save(zones_path)
+            Image.fromarray(out, "RGBA").save(zones_path)
         except Exception as exc:
             messagebox.showerror("Error", f"Save failed: {exc}")
             return
@@ -229,7 +253,8 @@ class ZonePainter:
         kill_count = int(np.count_nonzero(self.kill_layer))
         spawn_count = int(np.count_nonzero(self.spawn_layer))
         lookat_count = int(np.count_nonzero(self.lookat_layer)) if has_lookat else 0
-        self.status.config(text=f"Saved {zones_path.name} (kill: {kill_count}px, spawn: {spawn_count}px, lookat: {lookat_count}px)")
+        raceline_count = int(np.count_nonzero(self.raceline_layer)) if has_raceline else 0
+        self.status.config(text=f"Saved {zones_path.name} (kill: {kill_count}, spawn: {spawn_count}, lookat: {lookat_count}, raceline: {raceline_count}px)")
 
     # ── Layer operations ────────────────────────────────────────────
 
@@ -241,13 +266,19 @@ class ZonePainter:
 
     def _clear_spawn(self) -> None:
         if self.spawn_layer is not None:
-            self.spawn_layer[:] = False
+            self.spawn_layer[:] = 0
             self._rebuild_composite()
             self._refresh_viewport()
 
     def _clear_lookat(self) -> None:
         if self.lookat_layer is not None:
-            self.lookat_layer[:] = False
+            self.lookat_layer[:] = 0
+            self._rebuild_composite()
+            self._refresh_viewport()
+
+    def _clear_raceline(self) -> None:
+        if self.raceline_layer is not None:
+            self.raceline_layer[:] = False
             self._rebuild_composite()
             self._refresh_viewport()
 
@@ -302,7 +333,7 @@ class ZonePainter:
         cx0, cy0 = self._map_to_canvas(x0, y0)
         cx1, cy1 = self._map_to_canvas(x1, y1)
         mode = self.mode.get()
-        color = "#ff4444" if mode == "kill" else "#44ff44" if mode == "spawn" else "#ffdd44"
+        color = {"kill": "#ff4444", "spawn": "#44ff44", "lookat": "#ffdd44", "raceline": "#aa44ff", "eraser": "#ffffff"}.get(mode, "#ffffff")
         self.canvas.create_rectangle(cx0, cy0, cx1, cy1,
                                       outline=color, width=2, tags="brush_cursor")
 
@@ -399,6 +430,16 @@ class ZonePainter:
     # ── Painting ────────────────────────────────────────────────────
 
     def _begin_stroke(self, layer_name: str) -> None:
+        if layer_name == "eraser":
+            self._stroke_active = True
+            self._stroke_layer = "eraser"
+            self._stroke_snapshot = {
+                "kill": self.kill_layer.copy() if self.kill_layer is not None else None,
+                "spawn": self.spawn_layer.copy() if self.spawn_layer is not None else None,
+                "lookat": self.lookat_layer.copy() if self.lookat_layer is not None else None,
+                "raceline": self.raceline_layer.copy() if self.raceline_layer is not None else None,
+            }
+            return
         layer = self._get_layer(layer_name)
         if layer is None:
             return
@@ -410,11 +451,26 @@ class ZonePainter:
         if not self._stroke_active or self._stroke_snapshot is None:
             self._stroke_active = False
             return
-        layer = self._get_layer(self._stroke_layer)
-        if layer is not None and not np.array_equal(layer, self._stroke_snapshot):
-            if len(self._undo_stack) >= self._undo_max:
-                self._undo_stack.pop(0)
-            self._undo_stack.append((self._stroke_layer, self._stroke_snapshot))
+        if self._stroke_layer == "eraser":
+            # Check if any layer changed
+            changed = False
+            snapshots = self._stroke_snapshot
+            for name in ("kill", "spawn", "lookat", "raceline"):
+                layer = self._get_layer(name)
+                if layer is not None and snapshots.get(name) is not None:
+                    if not np.array_equal(layer, snapshots[name]):
+                        changed = True
+                        break
+            if changed:
+                if len(self._undo_stack) >= self._undo_max:
+                    self._undo_stack.pop(0)
+                self._undo_stack.append(("eraser", snapshots))
+        else:
+            layer = self._get_layer(self._stroke_layer)
+            if layer is not None and not np.array_equal(layer, self._stroke_snapshot):
+                if len(self._undo_stack) >= self._undo_max:
+                    self._undo_stack.pop(0)
+                self._undo_stack.append((self._stroke_layer, self._stroke_snapshot))
         self._stroke_active = False
         self._stroke_snapshot = None
 
@@ -425,6 +481,8 @@ class ZonePainter:
             return self.spawn_layer
         elif layer_name == "lookat":
             return self.lookat_layer
+        elif layer_name == "raceline":
+            return self.raceline_layer
         return None
 
     def _apply_brush(self, cx: int, cy: int, value: bool) -> None:
@@ -433,6 +491,11 @@ class ZonePainter:
             return
         mx, my = pos
         layer_name = self.mode.get()
+
+        if layer_name == "eraser":
+            self._apply_eraser(mx, my)
+            return
+
         layer = self._get_layer(layer_name)
         if layer is None:
             return
@@ -444,10 +507,37 @@ class ZonePainter:
         y1 = min(h, my + r + 1)
         x0 = max(0, mx - r)
         x1 = min(w, mx + r + 1)
-        layer[y0:y1, x0:x1] = value
+        if layer_name in ("spawn", "lookat"):
+            layer[y0:y1, x0:x1] = self.zone_id.get() if value else 0
+        else:
+            layer[y0:y1, x0:x1] = value
         self._rebuild_composite_region(x0, y0, x1, y1)
         self._refresh_viewport()
         self._update_brush_cursor(cx, cy)
+
+    def _apply_eraser(self, mx: int, my: int) -> None:
+        """Erase from all layers at once."""
+        if self.map_image is None:
+            return
+        h, w = self.map_image.shape
+        r = self.brush_size
+        y0 = max(0, my - r)
+        y1 = min(h, my + r + 1)
+        x0 = max(0, mx - r)
+        x1 = min(w, mx + r + 1)
+        if not self._stroke_active:
+            self._begin_stroke("eraser")
+        if self.kill_layer is not None:
+            self.kill_layer[y0:y1, x0:x1] = False
+        if self.spawn_layer is not None:
+            self.spawn_layer[y0:y1, x0:x1] = 0
+        if self.lookat_layer is not None:
+            self.lookat_layer[y0:y1, x0:x1] = 0
+        if self.raceline_layer is not None:
+            self.raceline_layer[y0:y1, x0:x1] = False
+        self._rebuild_composite_region(x0, y0, x1, y1)
+        self._refresh_viewport()
+        self._update_brush_cursor(self._cursor_x, self._cursor_y)
 
     def _on_rmb_down(self, event: tk.Event) -> None:
         self._apply_brush(event.x, event.y, False)
@@ -467,9 +557,15 @@ class ZonePainter:
         if not self._undo_stack:
             return
         layer_name, snapshot = self._undo_stack.pop()
-        layer = self._get_layer(layer_name)
-        if layer is not None:
-            layer[:] = snapshot
+        if layer_name == "eraser":
+            for name, snap in snapshot.items():
+                layer = self._get_layer(name)
+                if layer is not None and snap is not None:
+                    layer[:] = snap
+        else:
+            layer = self._get_layer(layer_name)
+            if layer is not None:
+                layer[:] = snapshot
         self._rebuild_composite()
         self._refresh_viewport()
 
@@ -491,6 +587,27 @@ class ZonePainter:
         self._apply_overlays_region(patch, x0, y0, x1, y1)
         self._composite[y0:y1, x0:x1] = patch
 
+    # Per-zone overlay colors: (R_add, G_add, B_add, R_mul, G_mul, B_mul)
+    _SPAWN_ZONE_COLORS = {
+        1: (0, 120, 0, 0.5, 1.0, 0.5),      # green
+        2: (0, 100, 120, 0.3, 1.0, 1.0),     # cyan
+        3: (0, 100, 0, 0.3, 1.0, 0.3),       # dark green
+    }
+    _LOOKAT_ZONE_COLORS = {
+        1: (140, 140, 0, 1.0, 1.0, 0.3),     # yellow
+        2: (160, 80, 0, 1.0, 1.0, 0.3),      # orange
+        3: (160, 0, 100, 1.0, 0.3, 1.0),     # magenta
+    }
+
+    @staticmethod
+    def _tint(rgb: np.ndarray, mask: np.ndarray, r_add: int, g_add: int, b_add: int,
+              r_mul: float, g_mul: float, b_mul: float) -> None:
+        if not np.any(mask):
+            return
+        rgb[mask, 0] = np.minimum((rgb[mask, 0] * r_mul).astype(np.int16) + r_add, 255).astype(np.uint8)
+        rgb[mask, 1] = np.minimum((rgb[mask, 1] * g_mul).astype(np.int16) + g_add, 255).astype(np.uint8)
+        rgb[mask, 2] = np.minimum((rgb[mask, 2] * b_mul).astype(np.int16) + b_add, 255).astype(np.uint8)
+
     def _apply_overlays(self, rgb: np.ndarray) -> None:
         if self.show_kill.get() and self.kill_layer is not None and np.any(self.kill_layer):
             m = self.kill_layer
@@ -498,15 +615,16 @@ class ZonePainter:
             rgb[m, 1] = (rgb[m, 1] * 0.3).astype(np.uint8)
             rgb[m, 2] = (rgb[m, 2] * 0.3).astype(np.uint8)
         if self.show_spawn.get() and self.spawn_layer is not None and np.any(self.spawn_layer):
-            m = self.spawn_layer
-            rgb[m, 0] = (rgb[m, 0] * 0.5).astype(np.uint8)
-            rgb[m, 1] = np.minimum(rgb[m, 1].astype(np.int16) + 120, 255).astype(np.uint8)
-            rgb[m, 2] = (rgb[m, 2] * 0.5).astype(np.uint8)
+            for zid, (ra, ga, ba, rm, gm, bm) in self._SPAWN_ZONE_COLORS.items():
+                self._tint(rgb, self.spawn_layer == zid, ra, ga, ba, rm, gm, bm)
         if self.show_lookat.get() and self.lookat_layer is not None and np.any(self.lookat_layer):
-            m = self.lookat_layer
-            rgb[m, 0] = np.minimum(rgb[m, 0].astype(np.int16) + 140, 255).astype(np.uint8)
-            rgb[m, 1] = np.minimum(rgb[m, 1].astype(np.int16) + 140, 255).astype(np.uint8)
-            rgb[m, 2] = (rgb[m, 2] * 0.3).astype(np.uint8)
+            for zid, (ra, ga, ba, rm, gm, bm) in self._LOOKAT_ZONE_COLORS.items():
+                self._tint(rgb, self.lookat_layer == zid, ra, ga, ba, rm, gm, bm)
+        if self.show_raceline.get() and self.raceline_layer is not None and np.any(self.raceline_layer):
+            m = self.raceline_layer
+            rgb[m, 0] = np.minimum(rgb[m, 0].astype(np.int16) + 120, 255).astype(np.uint8)
+            rgb[m, 1] = (rgb[m, 1] * 0.3).astype(np.uint8)
+            rgb[m, 2] = np.minimum(rgb[m, 2].astype(np.int16) + 160, 255).astype(np.uint8)
 
     def _apply_overlays_region(self, patch: np.ndarray, x0: int, y0: int, x1: int, y1: int) -> None:
         if self.show_kill.get() and self.kill_layer is not None:
@@ -516,17 +634,21 @@ class ZonePainter:
                 patch[m, 1] = (patch[m, 1] * 0.3).astype(np.uint8)
                 patch[m, 2] = (patch[m, 2] * 0.3).astype(np.uint8)
         if self.show_spawn.get() and self.spawn_layer is not None:
-            m = self.spawn_layer[y0:y1, x0:x1]
-            if np.any(m):
-                patch[m, 0] = (patch[m, 0] * 0.5).astype(np.uint8)
-                patch[m, 1] = np.minimum(patch[m, 1].astype(np.int16) + 120, 255).astype(np.uint8)
-                patch[m, 2] = (patch[m, 2] * 0.5).astype(np.uint8)
+            sl = self.spawn_layer[y0:y1, x0:x1]
+            if np.any(sl):
+                for zid, (ra, ga, ba, rm, gm, bm) in self._SPAWN_ZONE_COLORS.items():
+                    self._tint(patch, sl == zid, ra, ga, ba, rm, gm, bm)
         if self.show_lookat.get() and self.lookat_layer is not None:
-            m = self.lookat_layer[y0:y1, x0:x1]
+            ll = self.lookat_layer[y0:y1, x0:x1]
+            if np.any(ll):
+                for zid, (ra, ga, ba, rm, gm, bm) in self._LOOKAT_ZONE_COLORS.items():
+                    self._tint(patch, ll == zid, ra, ga, ba, rm, gm, bm)
+        if self.show_raceline.get() and self.raceline_layer is not None:
+            m = self.raceline_layer[y0:y1, x0:x1]
             if np.any(m):
-                patch[m, 0] = np.minimum(patch[m, 0].astype(np.int16) + 140, 255).astype(np.uint8)
-                patch[m, 1] = np.minimum(patch[m, 1].astype(np.int16) + 140, 255).astype(np.uint8)
-                patch[m, 2] = (patch[m, 2] * 0.3).astype(np.uint8)
+                patch[m, 0] = np.minimum(patch[m, 0].astype(np.int16) + 120, 255).astype(np.uint8)
+                patch[m, 1] = (patch[m, 1] * 0.3).astype(np.uint8)
+                patch[m, 2] = np.minimum(patch[m, 2].astype(np.int16) + 160, 255).astype(np.uint8)
 
     def _refresh_viewport(self) -> None:
         if self._composite is None:
