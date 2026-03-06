@@ -41,8 +41,8 @@ learn_after: 5000  # Start learning early (Session 54 proved this works better t
 update_every: 1  # Update frequency in steps.
 updates_per_step: 1  # Gradient updates per update step.
 hidden_sizes: [512, 512, 256]  # Scaled up for 450-ray LiDAR input (was [256, 256, 128] for 27 rays).
-grad_clip: 1.0  # Gradient norm clipping to prevent Q-gradient explosions.
-alpha_min: 0.03  # ZMIANA 1: was 0.005. Prevents entropy collapse that triggers Q-divergence on 40 maps.
+grad_clip: 0.5  # Tightened from 1.0 after Mapa_3_3 Q-loss divergence (10→386, 38×). Limits gradient explosions.
+alpha_min: 0.05  # Raised from 0.03 after Mapa_3_3 (alpha dropped to 0.045 before collapse). Higher floor keeps exploration alive.
 alpha_max: 0.3  # ZMIANA 1: new. Prevents entropy from dominating policy gradient (Mapa_1_2 alpha rose 0.15->0.23).
 utd_ratio: 2.0  # 0.25*8: same gradient updates/sec with 8x fewer transitions.
 stratified_sampling: false  # ZMIANA 2: was true. Stratified destroyed natural curriculum (1_4: 131m vs 1_3: 284m).

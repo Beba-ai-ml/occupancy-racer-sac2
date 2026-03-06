@@ -1,77 +1,66 @@
-# Occupancy Racer - Soft Actor-Critic v2
+# Occupancy Racer -- Soft Actor-Critic v2
 
-2D racing simulator that trains an autonomous vehicle using the Soft Actor-Critic (SAC) reinforcement learning algorithm on occupancy grid maps. Designed for sim-to-real transfer to an f1tenth robot platform.
+Async SAC reinforcement learning agent that trains on 2D occupancy grid maps and deploys on an F1Tenth robot with Jetson Orin Nano. Full 360-degree configurable LiDAR, 14 domain randomization features, and multi-zone spawn system for sim-to-real transfer.
 
 ![Training curve - mean reward over 100 episodes](photos/run22_mean100.png)
 
 ---
 
-## Overview
+## Key Features
 
-The project trains a neural network policy to race around tracks represented as PGM occupancy grids. The agent perceives the world through 27 simulated LIDAR rays and outputs steering and acceleration commands. Training uses the SAC algorithm with twin critics, automatic entropy tuning, and extensive domain randomization to enable transfer to physical hardware.
+- **Async multi-process training** -- 32 CPU actor processes feeding a central GPU learner via shared queues
+- **Configurable 360-degree LiDAR** -- front hemisphere at 0.5-degree (361 rays) + rear at 2-degree (89 rays) = 450 total rays, or legacy 27-ray mode
+- **14 domain randomization features** -- physics, surface, observation noise, control delays, action noise, wind gusts, battery sag, sensor drift, and more
+- **Multi-zone spawn system** -- up to 3 spawn/lookat zone pairs per map with zone-aware heading
+- **Sim-to-real bridge** -- complete inference pipeline for ROS2 + Jetson deployment
+- **Ackermann physics model** -- servo lag (50ms), motor lag (100ms), tire slip, quadratic drag, yaw inertia
+- **Interactive GUI tools** -- zone painter with eraser mode, PGM outline processor
 
 ---
 
 ## Architecture
 
 ```
-run.py / src/main.py          CLI entry points
+src/train_ssac.py           Async training (primary): central learner + N actor processes
+src/train.py                Sync training (legacy): single-process VecRacerEnv
+src/game.py                 Interactive mode (pygame, human or RL control)
         |
-  src/game.py                 Interactive mode (pygame, human or RL control)
+src/rl_agent.py             SAC agent (GaussianPolicy, twin QNetwork w/ LayerNorm, ReplayBuffer)
+src/racer_env.py            RL environment (configurable LiDAR, physics, reward, obstacles, zones)
+src/vehicle.py              Ackermann vehicle model (servo/motor lag, tire slip, yaw inertia)
+src/map_loader.py           PGM map + multi-zone overlay (3 zone IDs per channel)
+src/sim_config.py           Domain randomization config builder
         |
-  src/train.py                Synchronous multi-env training (VecRacerEnv)
-  src/train_ssac.py           Asynchronous multi-process training (primary)
-        |
-  src/rl_agent.py             SAC agent (GaussianPolicy, QNetwork, ReplayBuffer)
-  src/racer_env.py            RL environment (LIDAR, physics, reward, obstacles)
-  src/vehicle.py              Ackermann vehicle physics model
-  src/vec_env.py              Vectorized environment (multiprocessing)
-  src/sim_config.py           Domain randomization configuration
-  src/map_loader.py           PGM map + zone overlay loading
-  src/params.py               Parameter builders
-  src/config.py               YAML config utilities
-        |
-  sac_driver/                 Sim-to-real bridge (inference, ROS2 integration)
-    inference_engine.py        Load policy, run deterministic inference
-    policy_loader.py           Standalone policy loader (auto-infer architecture)
-    lidar_converter.py         ROS2 LaserScan -> training-format LIDAR
-    state_builder.py           Frame-stacked state vector builder
-    control_mapper.py          Policy actions -> Ackermann/Twist commands
+sac_driver/                 Sim-to-real bridge (inference on Jetson, ROS2 integration)
+  inference_engine.py       Load policy, run deterministic inference
+  policy_loader.py          Standalone policy loader (auto-infer architecture)
+  lidar_converter.py        ROS2 LaserScan -> training-format LiDAR
+  state_builder.py          Frame-stacked state vector builder
+  control_mapper.py         Policy actions -> Ackermann/Twist commands
 ```
 
-### Data Flow (Training)
+### Training Data Flow
 
-1. **Environment** (`racer_env.py`): Vehicle spawns on a free pixel of the occupancy map. LIDAR rays are cast on the grid. Domain randomization is applied.
-2. **Observation**: 27 normalized LIDAR ranges + speed + steering angle + collision flag = 30 values per frame. With 4-frame stacking = 120-dimensional state vector.
-3. **Agent** (`rl_agent.py`): GaussianPolicy outputs 2D action (steering, acceleration) via tanh squashing. Twin Q-networks evaluate state-action pairs.
-4. **Reward**: Shaped reward combining alignment with track direction, forward speed, wall clearance, and collision penalty (-20).
-5. **Learning**: SAC update with critic loss (MSE on Bellman target), actor loss (max Q - alpha * log_prob), alpha loss (entropy constraint), and soft target update (Polyak averaging).
+```
+[32 Actor Processes] --transitions--> [mp.Queue] --drain--> [Replay Buffer (1M)]
+        ^                                                           |
+        |                                                      sample()
+        |                                                      pin_memory()
+        |                                                           |
+        |                                                    [GPU Learner]
+        |                                                  (SAC update, UTD~1.0)
+        |                                                           |
+        +<------------- weights_queues (per-actor mp.Queue) -------+
+```
 
-### Data Flow (Inference / Sim-to-Real)
-
-1. **ROS2 LaserScan** -> `LidarConverter.convert()` -> normalized 27-ray vector
-2. Normalized LIDAR + vehicle speed + servo position + collision flag -> `StateBuilder.update()` -> 120-dim stacked state
-3. Stacked state -> `InferenceEngine.get_action()` -> (steering, acceleration)
-4. (steering, acceleration) -> `ControlMapper.map_to_ackermann()` -> Ackermann drive command
-
----
-
-## Directory Breakdown
-
-| Directory | Purpose |
-|-----------|---------|
-| `src/` | Core source: environment, agent, training loops, physics, config |
-| `sac_driver/` | Sim-to-real bridge: inference engine, LIDAR conversion, state building, control mapping |
-| `config/` | YAML configurations for game, physics, and training variants (config_sac_8, config_sac_10 through config_sac_13) |
-| `tools/` | Standalone GUI utilities: zone painter (spawn/kill/lookat), PGM outline processor |
-| `runs/` | Training outputs (checkpoints, CSV logs) -- gitignored |
-| `assets/maps/` | PGM occupancy grid maps and zone overlay PNGs |
+1. **Observation**: Configurable LiDAR (450 or 27 rays) + speed + steering + collision flag + IMU = N values per frame. With 4-frame stacking = state vector (1820-dim at 450 rays, 128-dim at 27 rays).
+2. **Action**: GaussianPolicy outputs 2D continuous action (steering, acceleration) via tanh squashing.
+3. **Reward**: Alignment with track direction + forward speed + wall clearance penalties + collision (-20).
+4. **Learning**: Twin critics with LayerNorm, automatic entropy tuning with alpha bounds, soft target update.
 
 ---
 
-## Installation
-
-**Requirements:** Python 3.10+
+## Quick Start
 
 ```bash
 git clone https://github.com/Beba-ai-ml/occupancy-racer-sac2.git
@@ -79,54 +68,147 @@ cd occupancy-racer-sac2
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-```
-
-The GUI tools (`tools/map_zone_painter.py`, `tools/pgm_outline_ui.py`) require `tkinter`. On Debian/Ubuntu, install it with:
-
-```bash
-sudo apt install python3-tk
-```
-
-## Quick Start
-
-```bash
-source .venv/bin/activate
-python run.py                    # Interactive mode (pygame)
+python run.py               # Interactive mode (pygame)
 ```
 
 ### Training
 
 ```bash
-# Synchronous training (simpler, single process + VecRacerEnv)
-python -m src.train --config config/game.yaml --physics config/physics.yaml
+# Async training (primary) -- 450-ray LiDAR, 40 maps
+python -m src.train_ssac --config-file config/config_sac_20.yaml --session-id MyRun --no-resume
 
-# Asynchronous training (primary, multi-process actors + central learner)
-python -m src.train_ssac --config-file config/config_sac_10.yaml
+# Sync training (legacy, 27-ray)
+python -m src.train --config config/game.yaml --physics config/physics.yaml
 ```
 
 ### Controls (Interactive Mode)
 
-- **W**: accelerate
-- **S**: brake / reverse
-- **A**: steer left
-- **D**: steer right
-- **Mouse wheel**: zoom in/out
-- **ESC**: quit
+| Key | Action |
+|-----|--------|
+| W/S | Accelerate / Brake |
+| A/D | Steer left / right |
+| Mouse wheel | Zoom in/out |
+| ESC | Quit |
 
 ---
 
-## Dependencies
+## Configuration
 
-From `requirements.txt`:
+### config/config_sac_20.yaml (Current Primary)
 
-- `pygame >= 2.5` -- rendering and interactive mode
-- `pyyaml >= 6.0` -- configuration file parsing
-- `numpy >= 1.24` -- array operations, LIDAR simulation, replay buffer
-- `torch >= 2.0` -- neural networks, SAC algorithm, `torch.compile`
+The main training config for 450-ray LiDAR with 40-map rotation:
 
-Optional (for tools and zone loading):
-- `Pillow` -- zone PNG loading in map_loader, zone painter tool
-- `tkinter` -- GUI tools (map_zone_painter, pgm_outline_ui); system package `python3-tk` on Debian/Ubuntu
+| Parameter | Value | Description |
+|-----------|-------|-------------|
+| `lidar_front_step_deg` | 0.5 | Front hemisphere angular step (361 rays) |
+| `lidar_rear_step_deg` | 2.0 | Rear hemisphere angular step (89 rays) |
+| `hidden_sizes` | [512, 512, 256] | Network layer sizes (~6.65M total params) |
+| `num_actors` | 32 | CPU actor processes |
+| `memory_size` | 1000000 | Replay buffer entries (~14.6 GB) |
+| `batch_size` | 256 | Mini-batch size |
+| `gamma` | 0.99 | Discount factor |
+| `tau` | 0.005 | Target network smoothing |
+| `policy_lr` / `q_lr` | 0.0003 | Actor / Critic learning rate |
+| `alpha_lr` | 0.0001 | Entropy coefficient learning rate |
+| `grad_clip` | 0.5 | Gradient norm clipping |
+| `alpha_min` / `alpha_max` | 0.05 / 0.3 | Entropy coefficient bounds |
+| `target_entropy` | -1.5 | Multi-task entropy target (default -2.0 is single-task) |
+| `action_repeat` | 8 | Decision rate: 8Hz at 60fps (matches real LiDAR) |
+| `stack_frames` | 4 | Frame stacking depth |
+| `map_switch_every` | 15 | Episodes between map rotation |
+| `episode_time_limit_s` | 90 | Max episode duration |
+
+### config/physics.yaml (Vehicle Physics)
+
+| Parameter | Value |
+|-----------|-------|
+| `max_speed` | 4.0 m/s (~14.4 km/h) |
+| `acceleration` | 2.0 m/s^2 |
+| `brake_deceleration` | 3.5 m/s^2 |
+| `max_steer_angle` | 20 degrees |
+| `friction` | 0.6 |
+| `vehicle size` | 0.45 x 0.30 m |
+
+---
+
+## LiDAR System
+
+Two modes, selected by config:
+
+**High-resolution 360-degree** (config_sac_20):
+- Front hemisphere (0-180 degrees): 0.5-degree steps = 361 rays
+- Rear hemisphere (180-360 degrees): 2-degree steps = 89 rays
+- Total: 450 rays, full surround awareness
+- Reward function uses only forward hemisphere (0-180 degrees) for left/right/front clearance groups
+
+**Legacy 27-ray** (no lidar config or older configs):
+- 210-degree arc centered at vehicle front
+- Dense region: 5-degree steps within +/-45 degrees (19 rays)
+- Sparse region: 15-degree steps outside (8 rays)
+
+Both modes: max range 20m, output normalized to [0, 1].
+
+---
+
+## Map System
+
+Maps are PGM occupancy grids (51 maps included) with optional zone overlays:
+
+- **White pixels** (>= 250): driveable free space
+- **Dark pixels**: walls/obstacles
+- **Zone overlay**: `{map_name}_zones.png` with RGBA channels:
+  - R: kill zones (episode terminates on entry)
+  - G: spawn zones (up to 3 zone IDs via intensity: 255/170/85)
+  - B: lookat zones (vehicle faces toward these, matched by zone ID)
+  - A: raceline (reserved)
+
+### Zone Painter
+
+```bash
+python -m tools.map_zone_painter
+```
+
+GUI tool for painting spawn, lookat, kill, and raceline zones. Supports 3 zone IDs with distinct overlay colors. **Eraser mode** clears all layers at once. Undo/redo per stroke.
+
+---
+
+## Domain Randomization
+
+14 features for sim-to-real transfer, configured in `game.yaml` sim_randomization:
+
+| Feature | Category | What it does |
+|---------|----------|--------------|
+| S1-S2 | Actuator lag | Servo 50ms, motor 100ms first-order filters |
+| S4 | Tire slip | Grip degrades above 4 m/s (min_grip=0.4) |
+| S5 | Quadratic drag | v^2 aerodynamic drag |
+| S6 | LiDAR sim | Beam divergence, ego-motion blur |
+| S7 | IMU | Linear accel + angular velocity channels |
+| S8 | Soft collision | 2 light contacts before hard collision |
+| S10 | Sensor delay | Per-episode base with +/-1 frame jitter |
+| S11 | Yaw inertia | 100ms low-pass on yaw rate |
+| S12 | Wind/slope | Ornstein-Uhlenbeck gusts (temporally correlated) |
+| S13 | Battery/friction | Continuous per-step sag and friction cycles |
+| S14 | Thermal drift | Sensor thermal drift (OU process) |
+| DR | Physics | Random scales on accel, brake, speed, friction, drag, steering |
+| DR | Observation | Gaussian noise on LiDAR, speed, steering readings |
+| DR | Control | Action noise, steer/accel rate limits, delay steps |
+
+---
+
+## Training History
+
+Key runs on 40-map pool:
+
+| Run | Episodes | Peak m100 | Final m100 | Key change |
+|-----|----------|-----------|------------|------------|
+| Session 53 | 24,000 | **250m** | 250m | Baseline (10 maps, 27 rays, [256,256,128]) |
+| Mapa_1_1 | 46,526 | 181m | 49m | 40 maps, no LayerNorm -- Q-divergence collapse |
+| Mapa_1_2 | 31,384 | 307m | 119m | +LayerNorm, alpha_min=0.03 -- gradual forgetting |
+| Mapa_1_3 | 26,000+ | 284m | 210m | +alpha_max=0.3, map_switch=15 -- slow decline |
+| Mapa_1_4 | 41,222 | 131m | 60m | +stratified=true -- WORST (curriculum destroyed) |
+| Mapa_3_3 | 8,401 | declining | declining | 450 rays, [512,512,256] -- Q-loss 38x divergence |
+
+Current config (post Mapa_3_3): `grad_clip=0.5`, `alpha_min=0.05` to contain larger network gradient explosions.
 
 ---
 
@@ -134,139 +216,23 @@ Optional (for tools and zone loading):
 
 | Command | Description |
 |---------|-------------|
-| `python run.py` | Interactive mode (calls `src.main.main()`) |
-| `python -m src.main` | Same as above |
-| `python -m src.train` | Synchronous multi-env training |
-| `python -m src.train_ssac` | Asynchronous multi-process training (primary) |
-| `python test_offline.py` | Offline inference pipeline test (no ROS2) |
-| `python tools/map_zone_painter.py` | GUI zone painter for maps |
-| `python tools/pgm_outline_ui.py` | GUI outline processor for PGM maps |
+| `python run.py` | Interactive mode (pygame) |
+| `python -m src.train_ssac --config-file CONFIG` | Async multi-process training (primary) |
+| `python -m src.train` | Synchronous training (legacy) |
+| `python -m tools.map_zone_painter` | GUI zone painter |
+| `python tools/pgm_outline_ui.py` | GUI PGM outline processor |
 
 ---
 
-## Configuration
+## Hardware
 
-### config/game.yaml (Master Config)
+**Training machine**: AMD Ryzen 7 5700X (16 threads), 46 GB RAM, RTX 3080 10 GB VRAM.
+With 450-ray config: ~28 GB RAM (14.6 GB buffer + 12.8 GB actors + queue).
 
-The main configuration file controlling all aspects of training and gameplay:
-
-- **map**: path to the occupancy grid map (YAML or PGM)
-- **display**: window width, height, FPS, zoom
-- **rl**: hidden_sizes, learning_rate, gamma, tau, alpha, batch_size, buffer_size, learn_every, learn_after, target_entropy, stack_frames
-- **training**: total_steps, checkpoint_every, render_every
-- **async**: num_actors, sync_every, transition_batch
-- **sim_randomization**: Full domain randomization settings (see below)
-
-### config/physics.yaml (Vehicle Physics)
-
-- acceleration: 2.0 m/s^2, brake_deceleration: 3.5 m/s^2
-- max_speed: 8.0 m/s, max_reverse_speed: 0.5 m/s
-- friction: 0.6, drag: 0.2
-- max_steer_angle: 20 degrees, wheelbase: 0.27 m (computed as length * 0.6)
-- Vehicle size: 0.45 x 0.30 m
-
-### config/config_sac_N.yaml (Training Variants)
-
-Numbered configs for the SSAC trainer with varying scale:
-- **config_sac_8**: 8 actors, medium buffer (baseline)
-- **config_sac_10**: 64 actors, 1.6M buffer, learn_after=40000, grad_clip + alpha_min (full scale)
-- **config_sac_11**: 128 actors, Dom_01 only, grad_clip + alpha_min
-- **config_sac_12**: 64 actors, 10 maps, utd_ratio=0.25, batch_size=256
-- **config_sac_13**: Latest iteration with tuned hyperparameters
-
-### Scaling `num_actors`
-
-With a hardcoded `utd_ratio`, fewer actors (e.g. 16 instead of 64) train ~4x slower in wall-clock time but leave the GPU mostly idle — compensate by raising `utd_ratio` proportionally (e.g. 8.0 for 16 actors) to keep the GPU saturated. Fewer actors also turn over the replay buffer 4x slower, which improves data retention across maps but increases off-policy staleness; adjust `sync_every` downward to keep actor weights fresh.
-
-### CPU-only training
-
-Set `device: cpu` and drop `num_actors` to ~4 so the learner has enough cores for `learn()` calls, which are ~20-50x slower without GPU tensor parallelism. Lower `utd_ratio` to 0.25-0.5 (or shrink `batch_size` to 64) to keep the main loop from falling behind actors — on CPU the learner is the bottleneck, not data collection.
-
-### Domain Randomization Categories
-
-Configured in `sim_randomization` section of game.yaml or config_sac_N.yaml:
-
-| Category | What it randomizes |
-|----------|--------------------|
-| `physics` | acceleration, braking, max_speed, friction, drag, steering angle, wheelbase |
-| `surface` | surface_friction, surface_drag |
-| `observation_noise` | Gaussian noise on LIDAR, speed, steering observations |
-| `control` | Steering and throttle delays (in steps) |
-| `dt_jitter` | Simulation timestep variation |
-| `action_noise` | Gaussian noise on actions |
-| `perturb` | Random velocity/angular perturbations during episodes |
-| `observation_delay` | Delayed observation delivery (in steps) |
-| `action_repeat` | Repeat actions for multiple steps |
-| `obstacles` | Static obstacles at episode start, dynamic obstacles during episode |
-| `reward` | Reward shaping weights (alignment, speed, clearance, collision) |
-| `track` | Track direction (clockwise/counter), center mode, direction-change probability |
-| `episode` | Max steps, max distance |
-
----
-
-## LIDAR System
-
-- **27 rays** over a **210-degree arc** centered at 90 degrees (vehicle front)
-- Dense region: 5-degree steps within +/-45 degrees of center (19 rays)
-- Sparse region: 15-degree steps outside the dense zone (8 rays)
-- Max range: 20 meters (configurable)
-- Front cone: 20 degrees for clearance penalty computation
-- Output: normalized distances in [0, 1] (distance / max_range)
-
----
-
-## Reward Function
-
-The reward at each step combines:
-
-1. **Alignment bonus**: Dot product of velocity direction with track-following direction (clockwise or counterclockwise around the track center)
-2. **Forward speed reward**: Proportional to forward speed (encouraging fast driving)
-3. **Clearance penalty**: Negative reward when front LIDAR rays detect walls too close
-4. **Collision penalty**: -20 on wall contact (episode terminates)
-5. **Reverse penalty**: Penalty for driving backwards
-6. **Balance penalty**: Discourages extreme steering at speed
-
----
-
-## Checkpoint System
-
-- Format version: `sac_checkpoint_v1`
-- Saved atomically (write to tmp, then rename) with timestamped backups
-- Contents: policy weights, critic weights, target network weights, all optimizer states, log_alpha, RNG states (Python, NumPy, PyTorch), training metadata (step count, episode count, best reward)
-- CSV logging alongside checkpoints with per-episode statistics
-- Resume training from checkpoint with `--resume` flag
-
----
-
-## Key Files
-
-| File | Why it matters |
-|------|----------------|
-| `src/racer_env.py` | The environment -- defines the entire RL problem (observations, actions, rewards, dynamics) |
-| `src/rl_agent.py` | The SAC algorithm -- policy, critics, replay buffer, learning updates |
-| `src/train_ssac.py` | Primary training script -- async multi-process architecture for fast data collection |
-| `src/vehicle.py` | Vehicle physics -- Ackermann steering model that must match the real robot |
-| `src/sim_config.py` | Domain randomization -- critical for sim-to-real transfer |
-| `config/game.yaml` | Master config -- all hyperparameters and DR settings in one place |
-| `sac_driver/` | The entire sim-to-real bridge -- everything needed to run the trained policy on hardware |
-
----
-
-## Map System
-
-Maps are PGM occupancy grids (P5 binary or P2 ASCII format) with optional YAML metadata files:
-
-- **White pixels** (value >= 250): free space (driveable)
-- **Dark pixels**: walls/obstacles
-- **Zone overlay**: `{map_name}_zones.png` with RGB channels:
-  - Red channel: kill zones (episode terminates if vehicle enters)
-  - Green channel: spawn zones (vehicle spawns here)
-  - Blue channel: lookat zones (vehicle faces toward these on spawn)
-
-The `tools/map_zone_painter.py` GUI allows painting these zones interactively.
+**Target deployment**: Jetson Orin Nano 8 GB, ROS2, VESC ESC, RPLidar (8 Hz).
 
 ---
 
 ## License
 
-This project is licensed under the MIT License. See [LICENSE](LICENSE) for details.
+MIT License. See [LICENSE](LICENSE) for details.
