@@ -2,7 +2,7 @@
 
 Async SAC reinforcement learning agent that trains on 2D occupancy grid maps and deploys on an F1Tenth robot with Jetson Orin Nano. Full 360-degree configurable LiDAR, 14 domain randomization features, and multi-zone spawn system for sim-to-real transfer.
 
-![Training curve - mean reward over 100 episodes](photos/run22_mean100.png)
+![SAC agent navigating an occupancy grid map with LiDAR](assets/demo.gif)
 
 ---
 
