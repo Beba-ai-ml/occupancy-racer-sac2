@@ -26,6 +26,7 @@ def build_vehicle_params(physics_cfg: dict) -> VehicleParams:
         wheelbase=wheelbase,
         length=length,
         width=width,
+        steer_speed_ref=float(vehicle_cfg.get("steer_speed_ref", 0.0)),
     )
 
 

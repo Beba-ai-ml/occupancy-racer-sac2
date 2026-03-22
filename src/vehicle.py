@@ -20,6 +20,7 @@ class VehicleParams:
     wheelbase: float
     length: float
     width: float
+    steer_speed_ref: float = 0.0  # Reference speed for steering curve; 0 = use max_speed
 
 
 @dataclass(frozen=True)
@@ -216,11 +217,12 @@ class Vehicle:
         min_steer_angle = math.radians(5.0)
         if max_steer_angle < min_steer_angle:
             min_steer_angle = max_steer_angle
-        if params.max_speed > 0:
-            speed_ratio = min(abs(self.speed) / params.max_speed, 1.0)
+        steer_ref = params.steer_speed_ref if params.steer_speed_ref > 0 else params.max_speed
+        if steer_ref > 0:
+            speed_ratio = min(abs(self.speed) / steer_ref, 1.0)
         else:
             speed_ratio = 0.0
-        steer_limit = max_steer_angle + (min_steer_angle - max_steer_angle) * speed_ratio
+        steer_limit = max_steer_angle + (min_steer_angle - max_steer_angle) * speed_ratio ** 2
         steer_target = steer * steer_limit
 
         # S1: Servo first-order lag filter

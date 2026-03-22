@@ -235,14 +235,15 @@ Physics model in `update(dt, throttle, brake, steer, map_params, accel_cmd)`:
 
 - **S1: Servo lag** -- first-order low-pass filter on steering angle (`servo_tau`).
 - **S1: Motor lag** -- first-order low-pass filter on acceleration (`motor_tau`).
-- **Speed-dependent steering** -- max steer angle reduces linearly with speed ratio.
+- **Speed-dependent steering** -- max steer angle reduces with quadratic speed ratio (`speed_ratio ** 2`); reference speed configurable via `steer_speed_ref` (decoupled from `max_speed`).
 - **S5: Quadratic drag** -- deceleration uses `friction + drag * v^2`.
 - **Ackermann steering** -- yaw rate = `(speed / wheelbase) * tan(steer_actual)`.
 - **S4: Tire slip** -- grip factor reduces above `slip_speed_threshold`.
 - **S11: Yaw inertia** -- low-pass filter on yaw rate (`yaw_inertia_tau`).
 
 `VehicleParams` dataclass: acceleration, brake_deceleration, reverse_acceleration,
-max_speed, max_reverse_speed, friction, drag, max_steer_angle, wheelbase, length, width.
+max_speed, max_reverse_speed, friction, drag, max_steer_angle, wheelbase, length, width,
+steer_speed_ref (reference speed for steering curve; 0 = use max_speed).
 
 `MapParams` dataclass: surface_friction, surface_drag.
 

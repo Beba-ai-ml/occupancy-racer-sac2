@@ -13,7 +13,7 @@ Async SAC reinforcement learning agent that trains on 2D occupancy grid maps and
 - **14 domain randomization features** -- physics, surface, observation noise, control delays, action noise, wind gusts, battery sag, sensor drift, and more
 - **Multi-zone spawn system** -- up to 3 spawn/lookat zone pairs per map with zone-aware heading
 - **Sim-to-real bridge** -- complete inference pipeline for ROS2 + Jetson deployment
-- **Ackermann physics model** -- servo lag (50ms), motor lag (100ms), tire slip, quadratic drag, yaw inertia
+- **Ackermann physics model** -- servo lag (50ms), motor lag (100ms), tire slip, quadratic drag, yaw inertia, quadratic steering curve
 - **Interactive GUI tools** -- zone painter with eraser mode, PGM outline processor
 
 ---
@@ -122,10 +122,11 @@ The main training config for 450-ray LiDAR with 40-map rotation:
 
 | Parameter | Value |
 |-----------|-------|
-| `max_speed` | 4.0 m/s (~14.4 km/h) |
+| `max_speed` | 2.5 m/s (~9 km/h) |
 | `acceleration` | 2.0 m/s^2 |
 | `brake_deceleration` | 3.5 m/s^2 |
 | `max_steer_angle` | 20 degrees |
+| `steer_speed_ref` | 8.0 m/s (decouples steering curve from max_speed) |
 | `friction` | 0.6 |
 | `vehicle size` | 0.45 x 0.30 m |
 
@@ -152,7 +153,7 @@ Both modes: max range 20m, output normalized to [0, 1].
 
 ## Map System
 
-Maps are PGM occupancy grids (51 maps included) with optional zone overlays:
+Maps are PGM occupancy grids (50 maps included) with optional zone overlays:
 
 - **White pixels** (>= 250): driveable free space
 - **Dark pixels**: walls/obstacles
