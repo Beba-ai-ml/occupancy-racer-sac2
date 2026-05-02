@@ -1,6 +1,6 @@
 config: config/game.yaml  # Path to the main game config YAML.
 physics: config/physics.yaml  # Path to the physics config YAML.
-map: mpo2.yaml  # mpo2 oval track.
+map: Rybnik_02  # R_01 track with opponent bot.
 map_pool: []
 map_switch_start_episode: 1200  # Start map rotation after N episodes.
 # --- ZMIANA 1 (2026-02-25): Anti-collapse na 40 mapach ---

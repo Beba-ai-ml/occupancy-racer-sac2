@@ -113,6 +113,112 @@ class _Obstacle:
         return float(math.hypot(self.half_size.x, self.half_size.y))
 
 
+class OpponentBot:
+    """Bot vehicle that follows raceline waypoints using Pure Pursuit.
+
+    Algorithm based on F1Tenth pure_pursuit node (ros2_ws).
+    Lookahead distance scales with speed: L = clamp(max_L * v / L_ratio, min_L, max_L).
+    Steering: angle = K_p * 2 * y_local / r^2 (curvature-based).
+    """
+
+    def __init__(
+        self,
+        waypoints: np.ndarray,
+        speed: float = 1.0,
+        vehicle_length: float = 0.45,
+        vehicle_width: float = 0.30,
+        wheelbase: float = 0.27,
+        min_lookahead: float = 0.3,
+        max_lookahead: float = 2.0,
+        lookahead_ratio: float = 3.0,
+        K_p: float = 0.45,
+        steering_limit_deg: float = 20.0,
+    ) -> None:
+        self.waypoints = waypoints
+        self.n_wps = len(waypoints)
+        self.speed = speed
+        self.half_size = pygame.Vector2(vehicle_length / 2, vehicle_width / 2)
+        self.wheelbase = wheelbase
+        self.min_lookahead = min_lookahead
+        self.max_lookahead = max_lookahead
+        self.lookahead_ratio = lookahead_ratio
+        self.K_p = K_p
+        self.steering_limit = math.radians(steering_limit_deg)
+        self.position = pygame.Vector2(0, 0)
+        self.heading = 0.0
+        self.wp_idx = 0
+
+    def reset(self, start_idx: int | None = None) -> None:
+        if start_idx is None:
+            start_idx = int(np.random.randint(0, self.n_wps))
+        self.wp_idx = start_idx % self.n_wps
+        wp = self.waypoints[self.wp_idx]
+        self.position = pygame.Vector2(float(wp[0]), float(wp[1]))
+        next_wp = self.waypoints[(self.wp_idx + 1) % self.n_wps]
+        self.heading = math.atan2(next_wp[1] - wp[1], next_wp[0] - wp[0])
+
+    def update(self, dt: float) -> None:
+        if dt <= 0 or self.n_wps < 2:
+            return
+        # Velocity-scaled lookahead (F1Tenth formula)
+        L = min(max(self.min_lookahead, self.max_lookahead * self.speed / self.lookahead_ratio), self.max_lookahead)
+
+        # Find farthest waypoint within lookahead distance (ahead of current index)
+        best_idx = self.wp_idx
+        best_dist = 0.0
+        for k in range(1, min(self.n_wps, 50)):
+            idx = (self.wp_idx + k) % self.n_wps
+            wp = self.waypoints[idx]
+            d = math.hypot(wp[0] - self.position.x, wp[1] - self.position.y)
+            if d <= L and d >= best_dist:
+                best_dist = d
+                best_idx = idx
+
+        target = self.waypoints[best_idx]
+
+        # Transform target to car-local frame
+        dx = target[0] - self.position.x
+        dy = target[1] - self.position.y
+        cos_h = math.cos(self.heading)
+        sin_h = math.sin(self.heading)
+        x_local = cos_h * dx + sin_h * dy
+        y_local = -sin_h * dx + cos_h * dy
+
+        # Pure Pursuit steering: angle = K_p * 2 * y / r^2
+        r_sq = x_local * x_local + y_local * y_local
+        if r_sq < 1e-6:
+            steer_angle = 0.0
+        else:
+            steer_angle = self.K_p * 2.0 * y_local / r_sq
+
+        steer_angle = max(-self.steering_limit, min(self.steering_limit, steer_angle))
+
+        # Bicycle model update
+        if abs(steer_angle) > 1e-4 and self.wheelbase > 0:
+            yaw_rate = (self.speed / self.wheelbase) * math.tan(steer_angle)
+        else:
+            yaw_rate = 0.0
+        self.heading += yaw_rate * dt
+        self.position.x += math.cos(self.heading) * self.speed * dt
+        self.position.y += math.sin(self.heading) * self.speed * dt
+
+        # Advance waypoint index
+        next_wp = self.waypoints[(self.wp_idx + 1) % self.n_wps]
+        if math.hypot(next_wp[0] - self.position.x, next_wp[1] - self.position.y) < self.speed * dt * 3 + 0.15:
+            self.wp_idx = (self.wp_idx + 1) % self.n_wps
+
+    def as_obstacle(self) -> _Obstacle:
+        # Conservative AABB that circumscribes the rotated chassis at any heading.
+        d = math.hypot(self.half_size.x, self.half_size.y)
+        return _Obstacle(
+            position=self.position.copy(),
+            half_size=pygame.Vector2(d, d),
+            dynamic=True,
+            ttl=None,
+            persistent=True,
+        )
+
+
 class RacerEnv:
     def __init__(
         self,
@@ -310,6 +416,40 @@ class RacerEnv:
         self._raceline_is_loop = False
         if map_data.raceline_mask is not None:
             self._build_raceline_waypoints(map_data.raceline_mask, map_data.resolution)
+
+        # Opponent bot (Pure Pursuit along raceline)
+        opponent_cfg = self.sim_cfg.get("opponent", {})
+        self._opponent_enabled = bool(opponent_cfg.get("enable", False))
+        self._opponent_start_episode = int(opponent_cfg.get("start_episode", 0))
+        self._opponent_speed = float(opponent_cfg.get("speed_mps", 1.0))
+        self._opponent_speed_var = float(opponent_cfg.get("speed_var", 0.2))
+        self._opponent_skip_prob = float(opponent_cfg.get("skip_prob", 0.0))
+        self._opponent: OpponentBot | None = None
+        self._opponent_active = False
+        self._bot_obstacle: _Obstacle | None = None
+        if self._opponent_enabled and self._raceline_waypoints is not None and len(self._raceline_waypoints) >= 2:
+            # Check if raceline direction matches track_direction, flip if not
+            wps = self._raceline_waypoints
+            # Compute net angular motion of raceline around map center
+            cx, cy = self.map_center.x, self.map_center.y
+            cross_sum = 0.0
+            for i in range(len(wps) - 1):
+                ax, ay = wps[i][0] - cx, wps[i][1] - cy
+                bx, by = wps[i + 1][0] - cx, wps[i + 1][1] - cy
+                cross_sum += ax * by - ay * bx
+            # pygame is y-down: cross_sum > 0 = visually clockwise, < 0 = counter-clockwise
+            raceline_cw = cross_sum > 0
+            track_cw = self.track_direction > 0
+            if raceline_cw != track_cw:
+                self._raceline_waypoints = wps[::-1].copy()
+                print("OpponentBot: raceline reversed to match track direction")
+            self._opponent = OpponentBot(
+                self._raceline_waypoints,
+                speed=self._opponent_speed,
+                vehicle_length=vehicle_params.length,
+                vehicle_width=vehicle_params.width,
+            )
+            print(f"OpponentBot: {len(self._raceline_waypoints)} waypoints, speed={self._opponent_speed:.1f} m/s")
 
         self.render_requested = bool(render)
         self.render_enabled = bool(render)
@@ -1391,6 +1531,9 @@ class RacerEnv:
         base_angle = self.vehicle.angle
         readings = []
         check_obstacles = self._episode_obstacles_active and bool(self._obstacles)
+        # Include opponent bot in obstacle check
+        if self._opponent_active and self._bot_obstacle is not None:
+            check_obstacles = True
 
         # S6: Ego-motion blur — compute yaw rate for scan distortion
         n_rays = len(self.lidar_angles_deg)
@@ -1411,6 +1554,9 @@ class RacerEnv:
                 (obs.position - obs.half_size, obs.position + obs.half_size, obs.radius)
                 for obs in self._obstacles
             ]
+            if self._opponent_active and self._bot_obstacle is not None:
+                b = self._bot_obstacle
+                obstacle_cache.append((b.position - b.half_size, b.position + b.half_size, b.radius))
             _intersect = self._ray_obstacle_intersection_cached
             for i, (angle_deg, offset) in enumerate(zip(self.lidar_angles_deg, self.lidar_offsets)):
                 ray_angle = base_angle + offset
@@ -1479,6 +1625,11 @@ class RacerEnv:
                     if self._vehicle_hits_obstacle(obs):
                         self._obstacle_collision = True
                         return True
+            # Check collision with opponent bot
+            if self._opponent_active and self._bot_obstacle is not None:
+                if self._vehicle_hits_obstacle(self._bot_obstacle):
+                    self._obstacle_collision = True
+                    return True
             return False
 
         local_ys, local_xs = np.nonzero(occ)
@@ -1504,6 +1655,10 @@ class RacerEnv:
                 if self._vehicle_hits_obstacle(obs):
                     self._obstacle_collision = True
                     return True
+        if self._opponent_active and self._bot_obstacle is not None:
+            if self._vehicle_hits_obstacle(self._bot_obstacle):
+                self._obstacle_collision = True
+                return True
         return False
 
     def _build_observation(self, readings: list[Tuple[float, float, pygame.Vector2]], collision: bool) -> np.ndarray:
@@ -1720,6 +1875,21 @@ class RacerEnv:
             self._wind_phase = float(np.random.uniform(0.0, 2.0 * math.pi))
             self._wind_ou_state = 0.0
         self._reset_obstacles()
+        # Opponent bot reset
+        self._opponent_active = False
+        self._bot_obstacle = None
+        if self._opponent is not None and self._episode_count >= self._opponent_start_episode:
+            if np.random.random() >= self._opponent_skip_prob:
+                self._opponent_active = True
+                # Per-episode speed randomization
+                speed_scale = 1.0 + np.random.uniform(-self._opponent_speed_var, self._opponent_speed_var)
+                self._opponent.speed = self._opponent_speed * speed_scale
+                self._opponent.reset()
+                for _ in range(20):
+                    if self._opponent.position.distance_to(self.vehicle.position) >= 1.5:
+                        break
+                    self._opponent.reset()
+                self._bot_obstacle = self._opponent.as_obstacle()
         lidar_readings = self._compute_lidar()
         collision = self._vehicle_collision()
         obs = self._build_observation(lidar_readings, collision)
@@ -1758,6 +1928,10 @@ class RacerEnv:
         self.vehicle.update(dt, False, False, steer, step_map_params, accel_cmd=accel_cmd)
         self._apply_perturbations(dt)
         self._apply_wind_slope(dt)
+        # Update opponent bot position before LiDAR scan
+        if self._opponent_active and self._opponent is not None:
+            self._opponent.update(dt)
+            self._bot_obstacle = self._opponent.as_obstacle()
         lidar_readings = self._compute_lidar()
         collision = self._vehicle_collision()
 
@@ -1850,6 +2024,7 @@ class RacerEnv:
             if self.map_surface_scaled is not None:
                 self.screen.blit(self.map_surface_scaled, (-offset.x, -offset.y))
             self._draw_obstacles(offset)
+            self._draw_opponent(offset)
             self._draw_lidar(readings, offset)
             self.vehicle.draw(self.screen, self.zoom, offset)
             pygame.display.flip()
@@ -1884,6 +2059,16 @@ class RacerEnv:
                 height_px,
             )
             pygame.draw.rect(self.screen, color, rect, 0)
+
+    def _draw_opponent(self, offset: pygame.Vector2) -> None:
+        if self.screen is None or not self._opponent_active or self._bot_obstacle is None:
+            return
+        b = self._bot_obstacle
+        pos_px = b.position * self.ppm * self.zoom - offset
+        w_px = max(2, int(round(b.half_size.x * 2.0 * self.ppm * self.zoom)))
+        h_px = max(2, int(round(b.half_size.y * 2.0 * self.ppm * self.zoom)))
+        rect = pygame.Rect(int(pos_px.x - w_px * 0.5), int(pos_px.y - h_px * 0.5), w_px, h_px)
+        pygame.draw.rect(self.screen, (255, 100, 30), rect, 0)
 
     def _init_render(self) -> None:
         if self.screen is not None:

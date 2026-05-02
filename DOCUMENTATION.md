@@ -185,6 +185,39 @@ Key methods:
 
 Final reward is scaled by `reward_scale` (0.8) and clipped to [-20, 20].
 
+#### class OpponentBot
+
+Pure Pursuit controller that follows the raceline mask. Optional adversary used for
+overtaking training; activates from `start_episode` onward with `1 - skip_prob`
+probability per episode and a per-episode speed jitter of `speed_var`.
+
+```python
+def __init__(self, waypoints: np.ndarray, speed: float = 1.0,
+             vehicle_length: float = 0.45, vehicle_width: float = 0.30,
+             wheelbase: float = 0.27, min_lookahead: float = 0.3,
+             max_lookahead: float = 2.0, lookahead_ratio: float = 3.0,
+             K_p: float = 0.45, steering_limit_deg: float = 20.0) -> None
+```
+
+Lookahead distance scales with speed (`L = clamp(max_L * v / L_ratio, min_L, max_L)`).
+Steering uses curvature-based pure pursuit (`angle = K_p * 2 * y_local / r^2`) clipped
+to `steering_limit`. State is integrated with a kinematic bicycle model.
+
+Key methods:
+
+- `reset(start_idx=None)` -- pick (or sample) a waypoint, position the bot there,
+  set heading toward the next waypoint. `RacerEnv.reset()` resamples up to 20 times
+  to keep the bot at least 1.5 m from the player at spawn.
+- `update(dt)` -- advance one physics tick: choose a target waypoint within the
+  speed-scaled lookahead, compute pure-pursuit steering, integrate the bicycle model.
+- `as_obstacle() -> _Obstacle` -- emit a heading-invariant circumscribing AABB
+  (`half_size = hypot(length/2, width/2)`) consumed by the collision SAT check and
+  the LiDAR ray-AABB intersection.
+
+Raceline direction (clockwise vs counter-clockwise) is verified at `RacerEnv.__init__`
+against `track_direction` and reversed if it disagrees, so the agent's reward signal
+and the bot's motion always match the configured racing direction.
+
 ### src/train_ssac.py
 
 Entry point: `train_ssac()` function, invoked via `python -m src.train_ssac`.

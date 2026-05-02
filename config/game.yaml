@@ -139,6 +139,13 @@ sim_randomization:
     ou_theta: 0.15
     ou_sigma_lidar: 0.005
     ou_sigma_speed: 0.005
+  # Opponent bot (Pure Pursuit along raceline)
+  opponent:
+    enable: true
+    start_episode: 1500
+    speed_mps: 1.0
+    speed_var: 0.2
+    skip_prob: 0.3
   action_repeat:
     steps: 8
   obstacles:

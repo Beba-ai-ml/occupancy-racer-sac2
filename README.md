@@ -14,6 +14,7 @@ Async SAC reinforcement learning agent that trains on 2D occupancy grid maps and
 - **Multi-zone spawn system** -- up to 3 spawn/lookat zone pairs per map with zone-aware heading
 - **Sim-to-real bridge** -- complete inference pipeline for ROS2 + Jetson deployment
 - **Ackermann physics model** -- servo lag (50ms), motor lag (100ms), tire slip, quadratic drag, yaw inertia, quadratic steering curve
+- **Opponent bot (Pure Pursuit)** -- raceline-following adversary with per-episode speed randomization and curriculum-staged activation, used for overtaking training
 - **Interactive GUI tools** -- zone painter with eraser mode, PGM outline processor
 
 ---

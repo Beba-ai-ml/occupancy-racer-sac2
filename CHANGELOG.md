@@ -4,6 +4,25 @@ All notable changes to this project are documented in this file.
 
 ---
 
+## [2026-05-02] Opponent Bot + Bug Fixes from Code Review
+
+### Added
+- **src/racer_env.py**: `OpponentBot` class — Pure Pursuit controller that follows the raceline mask. Per-episode speed randomization (`speed_var`), curriculum-staged activation (`start_episode`), random skip (`skip_prob`).
+- **config/game.yaml**: New `sim_randomization.opponent` block (`enable`, `start_episode`, `speed_mps`, `speed_var`, `skip_prob`).
+- **config/config_sac_20.yaml** + **config/config_sac_21.yaml**: Opponent-bot training configs on Rybnik_02 / R_01 raceline maps.
+- **assets/maps/**: New raceline maps `Rybnik_01.pgm`, `Rybnik_02.pgm` (+ zones), `Rybnik_04.pgm`, `Rybnik_05.pgm`.
+
+### Fixed
+- **Inverted raceline direction (reward poisoning).** `OpponentBot` raceline-direction check used math (y-up) cross-product convention, but waypoints are pygame y-down. The same `_raceline_waypoints` array drives `_clockwise_heading`, so the agent's alignment + distance-progress reward was silently negated on raceline maps. Flipped to `cross_sum > 0 = clockwise`.
+- **Bot phasing through vehicle near walls.** `_vehicle_collision()` checked the opponent only in the fast-path (no wall pixels in expanded AABB). The fall-through branch (wall pixels in AABB but rotated rect misses them) — i.e. exactly the racing line — silently dropped opponent collisions. Mirrored the bot check before the final `return False`.
+- **Bot spawning inside the player.** `OpponentBot.reset()` sampled the start waypoint uniformly across the raceline with no awareness of the player's spawn zone, producing instant step-0 collisions and ~-30 reward per affected episode after `start_episode`. Added a 20-attempt resampling loop with a 1.5 m minimum separation.
+- **Heading-ignoring opponent bbox.** `OpponentBot.as_obstacle()` forwarded `(length/2, width/2)` directly to `_Obstacle`, so collision SAT and LiDAR ray-AABB treated the bot as world-axis-aligned. Replaced with a conservative circumscribing radius `hypot(length/2, width/2)` so the AABB is heading-invariant.
+
+### Renamed
+- **assets/maps/**: `Rybnk_04.pgm` → `Rybnik_04.pgm`, `Rybnk_05.pgm` → `Rybnik_05.pgm` (typo would have broken any future config referencing the proper spelling).
+
+---
+
 ## [2026-02-10] Fix UTD Ratio Bug with Configurable utd_ratio
 
 ### Problem
