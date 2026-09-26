@@ -171,6 +171,25 @@ class EnvironmentTests(unittest.TestCase):
             # Last frame: 450 rays, collision, measured speed, servo, IMU x2.
             self.assertAlmostEqual(float(obs[-4]), env.vehicle.speed / 2.5, places=6)
 
+    def test_free_navigation_rewards_both_directions_equally(self):
+        env = make_env(full_profile=True)
+        env.reset()
+        self.assertTrue(env.free_navigation)
+        env.vehicle.speed = 1.0
+        readings = [(angle, env.lidar_max_range_m, pygame.Vector2()) for angle in env.lidar_angles_deg]
+        rewards = []
+        for angle in (0, math.pi):
+            env.vehicle.angle = angle
+            env.vehicle.position = pygame.Vector2(10, 12)
+            direction = pygame.Vector2(math.cos(angle), math.sin(angle))
+            env.prev_position = env.vehicle.position - direction * .1
+            rewards.append(env._compute_reward(readings, False))
+        self.assertAlmostEqual(rewards[0], rewards[1])
+        # A stationary car receives no forward-progress reward.
+        env.prev_position = env.vehicle.position.copy()
+        stopped_progress = env._compute_reward(readings, False)
+        self.assertGreater(rewards[0], stopped_progress)
+
     def test_episode_randomization_reset_and_speed_cap(self):
         env = make_env(full_profile=True)
         caps, delays = set(), set()

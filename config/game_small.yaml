@@ -150,6 +150,7 @@ sim_randomization:
     light_contact_penalty: -5.0
   distance_progress:
     enabled: true
+    mode: free
   sensor_delay:
     enabled: true
     lidar_delay_frames:

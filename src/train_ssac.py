@@ -16,6 +16,10 @@ except ImportError:
 import shutil
 import sys
 import threading
+import time
+import signal
+import math
+import random
 from typing import List
 
 import numpy as np
@@ -163,6 +167,18 @@ def _resolve_checkpoint_path(load_from: str) -> str | None:
 
 
 def _save_checkpoint_atomic(agent: SACAgent, path: str, meta: dict) -> None:
+    # Losses can still describe the previous step after an optimizer failure.
+    # Validate the actual state BEFORE rotating the last good checkpoint.
+    tensors = [p for model in (agent.policy, agent.critic1, agent.critic2,
+                               agent.critic1_target, agent.critic2_target)
+               for p in model.parameters()]
+    tensors.append(agent.log_alpha)
+    for optimizer in (agent.policy_optimizer, agent.critic_optimizer, agent.alpha_optimizer):
+        if optimizer is not None:
+            for values in optimizer.state.values():
+                tensors.extend(v for v in values.values() if isinstance(v, torch.Tensor))
+    if any(t is not None and not torch.isfinite(t).all().item() for t in tensors):
+        raise FloatingPointError("Refusing to replace checkpoint with non-finite model/optimizer state")
     tmp_path = f"{path}.tmp"
     backup_path = f"{path}.bak"
     agent.save_checkpoint(tmp_path, meta=meta)
@@ -229,7 +245,13 @@ def _actor_worker(
     device: str,
     episode_offset: int,
     sim_cfg: dict,
+    seed: int | None = None,
 ) -> None:
+    torch.set_num_threads(1)
+    if seed is not None:
+        random.seed(seed + actor_id)
+        np.random.seed(seed + actor_id)
+        torch.manual_seed(seed + actor_id)
     if not render:
         os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
 
@@ -370,6 +392,7 @@ def _actor_worker(
                     mean_dt,
                     episode_dt_max,
                     fps_mean,
+                    current_map_path,
                 )
             )
             _maybe_switch_map(episode_idx)
@@ -523,6 +546,9 @@ def _validate_config_keys(parser: argparse.ArgumentParser, cfg: dict) -> None:
 def train_ssac() -> None:
     parser = argparse.ArgumentParser(description="SSAC training for Occupancy Racer")
     parser.add_argument("--config-file", default=None, help="Path or name of a training config file")
+    parser.add_argument("--seed", type=int, default=None, help="Seed learner, replay and actors; async ordering remains nondeterministic")
+    parser.add_argument("--resume-warmup-steps", type=int, default=None,
+                        help="Fresh transitions before resumed learning; default retains historical actor-scaled warmup")
     parser.add_argument("--config", default="config/game.yaml", help="Path to game config")
     parser.add_argument("--physics", default="config/physics.yaml", help="Path to physics config")
     parser.add_argument("--map", default=None, help="Override map path")
@@ -600,6 +626,10 @@ def train_ssac() -> None:
         parser.set_defaults(**config_data)
 
     args = parser.parse_args(cleaned_args)
+    if args.seed is not None:
+        random.seed(args.seed)
+        np.random.seed(args.seed)
+        torch.manual_seed(args.seed)
 
     game_cfg = load_yaml(resolve_path(args.config))
     physics_cfg = load_yaml(resolve_path(args.physics))
@@ -692,6 +722,8 @@ def train_ssac() -> None:
         device=device,
     )
     utd_ratio = float(args.utd_ratio if args.utd_ratio is not None else rl_cfg.get("utd_ratio", 1.0))
+    if args.seed is not None:
+        agent.memory._rng = np.random.default_rng(args.seed)
     stratified_sampling = bool(
         args.stratified_sampling if args.stratified_sampling is not None
         else rl_cfg.get("stratified_sampling", False)
@@ -732,6 +764,9 @@ def train_ssac() -> None:
         "alpha_loss",
         "entropy",
         "death_reason",
+        "map_path",
+        "transitions",
+        "updates",
     ]
     extended_fieldnames = base_fieldnames + ["row_type", "config_json"]
     csv_has_data = os.path.exists(session_csv) and os.path.getsize(session_csv) > 0
@@ -862,6 +897,7 @@ def train_ssac() -> None:
                 "cpu",
                 episodes_completed,
                 sim_cfg,
+                args.seed,
             ),
             daemon=True,
         )
@@ -923,6 +959,8 @@ def train_ssac() -> None:
     base_actors = 4
     warmup_scale = max(1.0, float(num_actors) / float(base_actors))
     resume_warmup_steps = int(base_warmup_steps * warmup_scale) if episodes_completed > 0 else 0
+    if episodes_completed > 0 and args.resume_warmup_steps is not None:
+        resume_warmup_steps = max(0, args.resume_warmup_steps)
     if resume_warmup_steps > 0:
         print(f"Resume warmup: delaying learning and weight sync for {resume_warmup_steps} steps")
     print(f"  UTD ratio: {utd_ratio}")
@@ -1001,6 +1039,7 @@ def train_ssac() -> None:
         mean_dt: float,
         max_dt: float,
         fps_mean: float,
+        episode_map: str,
     ) -> None:
         alpha_value = float(agent.alpha.item())
         row = _build_csv_row(
@@ -1020,6 +1059,9 @@ def train_ssac() -> None:
                 "alpha_loss": f"{agent.last_alpha_loss:.6f}" if agent.last_alpha_loss is not None else "",
                 "entropy": f"{agent.last_entropy:.6f}" if agent.last_entropy is not None else "",
                 "death_reason": death_reason or "collision",
+                "map_path": episode_map,
+                "transitions": transitions,
+                "updates": agent.total_updates,
                 "row_type": "episode",
                 "config_json": "",
             }
@@ -1052,6 +1094,7 @@ def train_ssac() -> None:
                     mean_dt,
                     max_dt,
                     fps_mean,
+                    episode_map,
                 ) = stats_queue.get_nowait()
             except queue_mod.Empty:
                 break
@@ -1077,6 +1120,7 @@ def train_ssac() -> None:
                     mean_dt,
                     max_dt,
                     fps_mean,
+                    episode_map,
                 )
             if save_every > 0 and total_episodes % save_every == 0:
                 meta = {
@@ -1095,10 +1139,52 @@ def train_ssac() -> None:
                 backup_path = os.path.join(session_dir, backup_name)
                 _save_checkpoint_backup(session_ckpt, backup_path)
 
+    training_started = time.monotonic()
+    next_health = 0.0
+    shutdown_requested = False
+
+    def request_shutdown(signum, frame):
+        nonlocal shutdown_requested
+        shutdown_requested = True
+
+    previous_term = signal.signal(signal.SIGTERM, request_shutdown)
+    previous_int = signal.signal(signal.SIGINT, request_shutdown)
+    completed_normally = False
+
+    def write_health() -> None:
+        nonlocal next_health
+        payload = {
+            "timestamp": time.time(), "session_id": session_id,
+            "elapsed_s": time.monotonic() - training_started,
+            "episodes": total_episodes, "transitions": transitions,
+            "updates": agent.total_updates, "replay_size": len(agent.memory),
+            "alpha": float(agent.alpha.item()), "q_loss": agent.last_q_loss,
+            "policy_loss": agent.last_policy_loss,
+            "actors_alive": sum(p.is_alive() for p in processes),
+            "actors_expected": num_actors, "pid": os.getpid(),
+            "device": str(agent.device),
+            "gpu_name": torch.cuda.get_device_name(agent.device) if agent.device.type == "cuda" else "cpu",
+        }
+        health_path = Path(session_dir) / "health.json"
+        health_tmp = health_path.with_suffix(".json.tmp")
+        health_tmp.write_text(json.dumps(payload), encoding="utf-8")
+        health_tmp.replace(health_path)
+        next_health = time.monotonic() + 30.0
+
     try:
         if not csv_has_data:
             _write_config_snapshot()
         while True:
+            if time.monotonic() >= next_health:
+                write_health()
+                failed = [p.pid for p in processes if not p.is_alive()]
+                if failed:
+                    raise RuntimeError(f"Training actors exited unexpectedly: {failed}")
+                if any(v is not None and not math.isfinite(v) for v in
+                       (agent.last_q_loss, agent.last_policy_loss, float(agent.alpha.item()))):
+                    raise FloatingPointError("Non-finite training loss or alpha")
+            if shutdown_requested:
+                break
             if max_episodes > 0 and total_episodes >= max_episodes:
                 break
 
@@ -1147,6 +1233,9 @@ def train_ssac() -> None:
                 num_updates = max(1, round(transitions_received * utd_ratio))
                 for _ in range(num_updates):
                     agent.last_loss = agent.learn(stratified=stratified_sampling)
+                    if any(v is not None and not math.isfinite(v)
+                           for v in (agent.last_q_loss, agent.last_policy_loss)):
+                        raise FloatingPointError("Non-finite loss immediately after optimizer update")
 
             # --- Drain episode stats ---
             _drain_stats()
@@ -1161,11 +1250,30 @@ def train_ssac() -> None:
                         _drain_queue(wq)
                         wq.put(new_weights)
 
+        completed_normally = True
+
     finally:
-        log_buffer.shutdown()
         stop_event.set()
-        for proc in processes:
-            proc.join(timeout=1.0)
+        # Preserve the latest learned weights on an orderly stop, including a
+        # bounded diagnostic run. Do not wait for the next episode multiple.
+        try:
+            if completed_normally and agent.total_updates > 0 and all(v is None or math.isfinite(v) for v in
+                                               (agent.last_q_loss, agent.last_policy_loss, float(agent.alpha.item()))):
+                _save_checkpoint_atomic(agent, session_ckpt, {
+                    "session_id": session_id, "episodes_trained_total": total_episodes,
+                    "episodes_trained": total_episodes,
+                    "distance_history": list(distance_history),
+                })
+            write_health()
+        finally:
+            log_buffer.shutdown()
+            signal.signal(signal.SIGTERM, previous_term)
+            signal.signal(signal.SIGINT, previous_int)
+            for proc in processes:
+                proc.join(timeout=1.0)
+                if proc.is_alive():
+                    proc.terminate()
+                    proc.join(timeout=1.0)
 
 
 if __name__ == "__main__":

@@ -565,6 +565,7 @@ class RacerEnv:
         # S9: Remove alignment reward, add distance progress
         progress_cfg = self.sim_cfg.get("distance_progress", {})
         self.distance_progress_enabled = self.sim_enabled and bool(progress_cfg.get("enabled", False))
+        self.free_navigation = progress_cfg.get("mode", "track") == "free"
 
         # S10: Async sensor delays
         sensor_delay_cfg = self.sim_cfg.get("sensor_delay", {})
@@ -1814,7 +1815,7 @@ class RacerEnv:
         if self.distance_progress_enabled:
             # S9: Distance progress reward — project onto track heading (not vehicle heading)
             delta_pos = self.vehicle.position - self.prev_position
-            tangent_angle = self._clockwise_heading(self.vehicle.position)
+            tangent_angle = self.vehicle.angle if self.free_navigation else self._clockwise_heading(self.vehicle.position)
             heading = pygame.Vector2(math.cos(tangent_angle), math.sin(tangent_angle))
             forward_progress = max(0.0, delta_pos.dot(heading))
             reward_forward = (
