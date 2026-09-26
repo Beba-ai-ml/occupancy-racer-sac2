@@ -977,6 +977,7 @@ def train_ssac() -> None:
             "args": vars(args),
             "resolved": resolved,
             "sim_cfg": sim_cfg,
+            "physics_cfg": physics_cfg,
         }
         row = _build_csv_row(
             {

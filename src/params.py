@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 
 from .vehicle import MapParams, VehicleParams
+from .steering import SteeringProfile
 
 
 def build_vehicle_params(physics_cfg: dict) -> VehicleParams:
@@ -13,6 +14,17 @@ def build_vehicle_params(physics_cfg: dict) -> VehicleParams:
     width = float(size_cfg.get("width", 0.30))
     max_steer_deg = float(vehicle_cfg.get("max_steer_angle_deg", 20.0))
     wheelbase = float(vehicle_cfg.get("wheelbase", length * 0.6))
+    steering_cfg = vehicle_cfg.get("steering_profile")
+    steering_profile = None
+    if steering_cfg is not None:
+        steering_profile = SteeringProfile(
+            delay_s=float(steering_cfg["delay_s"]),
+            full_travel_s=float(steering_cfg["full_travel_s"]),
+            slow_diameter_m=float(steering_cfg["slow_diameter_m"]),
+            fast_diameter_m=float(steering_cfg["fast_diameter_m"]),
+            reference_speed_mps=float(steering_cfg["reference_speed_mps"]),
+            timing_scale_range=tuple(float(v) for v in steering_cfg.get("timing_scale_range", [1.0, 1.0])),
+        )
 
     return VehicleParams(
         acceleration=float(vehicle_cfg.get("acceleration", 2.0)),
@@ -27,6 +39,9 @@ def build_vehicle_params(physics_cfg: dict) -> VehicleParams:
         length=length,
         width=width,
         steer_speed_ref=float(vehicle_cfg.get("steer_speed_ref", 0.0)),
+        steering_profile=steering_profile,
+        speed_limit_choices=tuple(float(v) for v in vehicle_cfg.get("speed_limit_choices", [])),
+        speed_observation_scale_mps=float(vehicle_cfg.get("speed_observation_scale_mps", 0.0)),
     )
 
 

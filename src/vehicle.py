@@ -6,6 +6,8 @@ from typing import Tuple
 
 import pygame
 
+from .steering import SteeringActuator, SteeringProfile
+
 
 @dataclass(frozen=True)
 class VehicleParams:
@@ -21,6 +23,15 @@ class VehicleParams:
     length: float
     width: float
     steer_speed_ref: float = 0.0  # Reference speed for steering curve; 0 = use max_speed
+    steering_profile: SteeringProfile | None = None
+    speed_limit_choices: tuple[float, ...] = ()
+    speed_observation_scale_mps: float = 0.0  # 0 preserves legacy normalization
+
+    def __post_init__(self) -> None:
+        if any(not math.isfinite(v) or v <= 0 or v > self.max_speed for v in self.speed_limit_choices):
+            raise ValueError("Speed limits must be positive, finite and no greater than max_speed")
+        if not math.isfinite(self.speed_observation_scale_mps) or self.speed_observation_scale_mps < 0:
+            raise ValueError("Observation speed scale must be finite and nonnegative")
 
 
 @dataclass(frozen=True)
@@ -59,6 +70,8 @@ class Vehicle:
         self.motor_tau = motor_tau
         self.servo_actual = 0.0
         self.accel_actual = 0.0
+        self.steering = SteeringActuator(params.steering_profile) if params.steering_profile else None
+        self.speed_limit_mps = max(params.speed_limit_choices) if params.speed_limit_choices else params.max_speed
 
         # S4: Tire slip model
         self.slip_speed_threshold = slip_speed_threshold
@@ -226,8 +239,13 @@ class Vehicle:
         steer_target = steer * steer_limit
 
         # S1: Servo first-order lag filter
-        alpha_servo = min(dt / self.servo_tau, 1.0)
-        self.servo_actual += (steer_target - self.servo_actual) * alpha_servo
+        if self.steering is not None:
+            # The calibrated profile replaces (rather than stacks with) the
+            # old servo filter and speed-dependent steering-angle reduction.
+            self.servo_actual = self.steering.step(steer, dt) * params.max_steer_angle
+        else:
+            alpha_servo = min(dt / self.servo_tau, 1.0)
+            self.servo_actual += (steer_target - self.servo_actual) * alpha_servo
 
         # --- Compute target acceleration ---
         accel = 0.0
@@ -260,17 +278,18 @@ class Vehicle:
         else:
             self.speed += self.accel_actual * dt
 
-        if self.speed > params.max_speed:
-            self.speed = params.max_speed
-        elif self.speed < -params.max_reverse_speed:
-            self.speed = -params.max_reverse_speed
+        self.clamp_speed()
 
         # --- Steering / yaw rate ---
         if abs(self.speed) > 0.05 and params.wheelbase > 0:
             target_yaw_rate = (self.speed / params.wheelbase) * math.tan(self.servo_actual)
 
-            # S4: Tire slip — reduce grip at high speed on smooth floor
-            if abs(self.speed) > self.slip_speed_threshold:
+            if params.steering_profile is not None:
+                full_tan = math.tan(params.max_steer_angle)
+                fraction = math.tan(self.servo_actual) / full_tan if full_tan > 0 else 0.0
+                target_yaw_rate = self.speed * fraction / params.steering_profile.turning_radius(self.speed)
+            # Legacy slip stays exclusive to the legacy steering model.
+            elif abs(self.speed) > self.slip_speed_threshold:
                 speed_excess = (abs(self.speed) - self.slip_speed_threshold) / self.slip_speed_threshold
                 grip = max(self.min_grip_factor, 1.0 - speed_excess * self.grip_reduction_rate)
                 target_yaw_rate *= grip
@@ -284,6 +303,19 @@ class Vehicle:
 
         direction = pygame.Vector2(math.cos(self.angle), math.sin(self.angle))
         self.position += direction * self.speed * dt
+
+    def clamp_speed(self) -> None:
+        # This limits executed motion, not the requested acceleration or the
+        # speed normalization observed by the policy.
+        cap = min(self.params.max_speed, self.speed_limit_mps) if self.params.speed_limit_choices else self.params.max_speed
+        self.speed = max(-self.params.max_reverse_speed, min(cap, self.speed))
+
+    def reset_actuators(self, delay_scale: float = 1.0, travel_scale: float = 1.0) -> None:
+        self.servo_actual = 0.0
+        self.accel_actual = 0.0
+        self.yaw_rate = 0.0
+        if self.steering is not None:
+            self.steering.reset(delay_scale, travel_scale)
 
     def draw(self, surface: pygame.Surface, scale: float, offset: pygame.Vector2) -> None:
         if not self.render_enabled:

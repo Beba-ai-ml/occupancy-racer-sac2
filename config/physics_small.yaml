@@ -1,0 +1,31 @@
+# Small-map profile, user estimates 2026-09-26. Does not alter historical runs.
+vehicle:
+  acceleration: 2.0
+  brake_deceleration: 3.5
+  reverse_acceleration: 1.5
+  max_speed: 2.0
+  # Executed speed cap sampled per episode; action range stays unchanged.
+  speed_limit_choices: [1.0, 1.5, 2.0]
+  # Match ROS input normalization, regardless of the physical cap.
+  speed_observation_scale_mps: 2.5
+  max_reverse_speed: 0.5
+  steer_speed_ref: 8.0
+  friction: 0.6
+  drag: 0.2
+  max_steer_angle_deg: 20.0
+  wheelbase: 0.35
+  size_m:
+    length: 0.45
+    width: 0.30
+  steering_profile:
+    delay_s: 0.150
+    full_travel_s: 0.300
+    # Full-lock turning-circle DIAMETERS, not radii. Approximate empirical fit.
+    slow_diameter_m: 1.5
+    fast_diameter_m: 4.0
+    reference_speed_mps: 2.0
+    # Engineering starting range, not a measured distribution.
+    timing_scale_range: [0.9, 1.1]
+map:
+  surface_friction: 1.0
+  surface_drag: 0.0

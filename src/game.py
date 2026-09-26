@@ -536,7 +536,8 @@ class Game:
             lidar_norm.append(min(distance_mm / range_mm, 1.0))
 
         speed_kmh = abs(self.vehicle.speed) * 3.6
-        max_speed_kmh = max(self.vehicle_params.max_speed * 3.6, 1e-3)
+        speed_scale = self.vehicle_params.speed_observation_scale_mps or self.vehicle_params.max_speed
+        max_speed_kmh = max(speed_scale * 3.6, 1e-3)
         speed_norm = min(speed_kmh / max_speed_kmh, 1.0)
         servo_norm = min(max(self.servo_value / 20.0, 0.0), 1.0)
 
@@ -589,9 +590,7 @@ class Game:
         self.vehicle.position = pygame.Vector2(spawn_position)
         self.vehicle.angle = spawn_angle
         self.vehicle.speed = 0.0
-        self.vehicle.servo_actual = 0.0
-        self.vehicle.accel_actual = 0.0
-        self.vehicle.yaw_rate = 0.0
+        self.vehicle.reset_actuators()
         self.servo_value = 10.0
         self.episode_reward = 0.0
         self.episode_penalty = 0.0

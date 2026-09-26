@@ -613,6 +613,9 @@ class RacerEnv:
         self.control_enabled = self.sim_enabled and bool(control_cfg.get("enabled", False))
         self.delay_steps_range = self._parse_int_range(control_cfg.get("delay_steps"), (0, 0))
         self.steer_rate_limit = float(control_cfg.get("steer_rate_limit", 0.0))
+        if vehicle_params.steering_profile is not None and self.control_enabled:
+            if self.delay_steps_range != (0, 0) or self.steer_rate_limit != 0.0:
+                raise ValueError("Calibrated steering requires control.delay_steps=[0,0] and steer_rate_limit=0 to avoid double lag")
         self.accel_rate_limit = float(control_cfg.get("accel_rate_limit", 0.0))
 
         dt_cfg = self.sim_cfg.get("dt_jitter", {})
@@ -1719,7 +1722,8 @@ class RacerEnv:
             speed_raw += self._speed_bias
 
         speed_kmh = abs(speed_raw) * 3.6
-        max_speed_kmh = max(self.vehicle_params.max_speed * 3.6, 1e-3)
+        speed_scale = self.vehicle_params.speed_observation_scale_mps or self.vehicle_params.max_speed
+        max_speed_kmh = max(speed_scale * 3.6, 1e-3)
         speed_norm = min(speed_kmh / max_speed_kmh, 1.0)
         servo_norm = min(max(self.servo_value / 20.0, 0.0), 1.0)
         if self.obs_noise_enabled:
@@ -1751,7 +1755,8 @@ class RacerEnv:
 
             # W1 fix: use per-episode base delay with ±1 frame jitter
             lidar_delay = max(0, self._ep_lidar_delay + int(np.random.randint(-1, 2)))
-            speed_delay = max(0, self._ep_speed_delay + int(np.random.randint(-1, 2)))
+            speed_delay = (0 if self.vehicle_params.steering_profile is not None and self.speed_delay_range == (0, 0)
+                           else max(0, self._ep_speed_delay + int(np.random.randint(-1, 2))))
             imu_delay = max(0, self._ep_imu_delay + int(np.random.randint(-1, 2)))
 
             lidar_idx = min(lidar_delay, len(self._lidar_obs_history) - 1)
@@ -1840,9 +1845,14 @@ class RacerEnv:
         self.vehicle.angle = spawn_angle
         self.vehicle.speed = 0.0
         # B1: Reset actuator lag state from previous episode
-        self.vehicle.servo_actual = 0.0
-        self.vehicle.accel_actual = 0.0
-        self.vehicle.yaw_rate = 0.0
+        delay_scale = travel_scale = 1.0
+        profile = self.vehicle_params.steering_profile
+        if profile is not None and self.sim_enabled:
+            delay_scale = self._sample_range(profile.timing_scale_range)
+            travel_scale = self._sample_range(profile.timing_scale_range)
+        self.vehicle.reset_actuators(delay_scale, travel_scale)
+        limits = self.vehicle_params.speed_limit_choices
+        self.vehicle.speed_limit_mps = float(np.random.choice(limits)) if limits else self.vehicle_params.max_speed
         self.servo_value = 10.0
         self.prev_position = self.vehicle.position.copy()
         self.stuck_time = 0.0
@@ -1900,11 +1910,11 @@ class RacerEnv:
         steer, accel_cmd = self._prepare_action(action)
 
         if self.render_requested and self.clock is not None:
-            dt = self.clock.tick(self.fps) / 1000.0
-            dt = min(dt, 0.05)
+            elapsed = self.clock.tick(self.fps) / 1000.0
+            dt = self.fixed_dt if self.vehicle_params.steering_profile is not None else min(elapsed, 0.05)
         else:
             dt = self.fixed_dt
-        if self.dt_jitter_enabled and not self.render_requested:
+        if self.dt_jitter_enabled and (not self.render_requested or self.vehicle_params.steering_profile is not None):
             dt *= self._sample_range(self.dt_scale_range)
         self.last_dt = dt
         self.episode_time_s += dt
@@ -1928,6 +1938,8 @@ class RacerEnv:
         self.vehicle.update(dt, False, False, steer, step_map_params, accel_cmd=accel_cmd)
         self._apply_perturbations(dt)
         self._apply_wind_slope(dt)
+        if self.vehicle_params.speed_limit_choices:
+            self.vehicle.clamp_speed()  # Perturbations and slopes may also change speed.
         # Update opponent bot position before LiDAR scan
         if self._opponent_active and self._opponent is not None:
             self._opponent.update(dt)
