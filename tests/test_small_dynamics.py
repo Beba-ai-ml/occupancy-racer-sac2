@@ -107,7 +107,9 @@ class SteeringTests(unittest.TestCase):
 
     def test_invalid_profile_rejected(self):
         for field, value in [("delay_s", -1), ("full_travel_s", 0), ("slow_diameter_m", math.nan),
-                             ("reference_speed_mps", 0), ("timing_scale_range", (1.1, .9))]:
+                             ("reference_speed_mps", 0), ("timing_scale_range", (1.1, .9)),
+                             ("mid_speed_mps", 0), ("mid_diameter_m", 4),
+                             ("fast_diameter_range_m", (1, 2))]:
             with self.assertRaises(ValueError):
                 replace(profile(), **{field: value})
 
@@ -115,8 +117,8 @@ class SteeringTests(unittest.TestCase):
 class VehicleTests(unittest.TestCase):
     def test_full_circles_measured_from_positions(self):
         p = replace(build_vehicle_params(PHYSICS), friction=0, drag=0)
-        # With a quasi-static speed, diameter tends to 1.5 m. At 2 m/s it is 4 m.
-        for speed, expected in [(.1, 1.50625), (1, 2.125), (1.5, 2.90625), (2, 4)]:
+        # The two user-specified speeds must produce the requested circles.
+        for speed, expected in [(1.5, 2.5), (2, 3)]:
             for side in (-1, 1):
                 v = Vehicle(p, (0, 0), 10, render_enabled=False)
                 v.speed = speed
@@ -192,11 +194,17 @@ class EnvironmentTests(unittest.TestCase):
 
     def test_episode_randomization_reset_and_speed_cap(self):
         env = make_env(full_profile=True)
-        caps, delays = set(), set()
+        caps, delays, fast_diameters = set(), set(), set()
         for _ in range(60):
             env.reset()
             caps.add(env.vehicle.speed_limit_mps)
             delays.add(env.vehicle.steering.delay_s)
+            steering = env.vehicle_params.steering_profile
+            fast_diameters.add(round(steering.fast_diameter_m, 3))
+            self.assertGreaterEqual(steering.fast_diameter_m, 2)
+            self.assertLessEqual(steering.fast_diameter_m, 3)
+            expected_mid = 1.5 + (steering.fast_diameter_m - 1.5) * (2/3)
+            self.assertAlmostEqual(2 * steering.turning_radius(1.5), expected_mid)
             self.assertGreaterEqual(env.vehicle.steering.delay_s, .135)
             self.assertLessEqual(env.vehicle.steering.delay_s, .165)
             self.assertEqual(env.vehicle.steering.actual, 0)
@@ -204,6 +212,7 @@ class EnvironmentTests(unittest.TestCase):
             env.step([1, 2])
         self.assertEqual(caps, {1, 1.5, 2})
         self.assertGreater(len(delays), 1)
+        self.assertGreater(len(fast_diameters), 1)
 
     def test_legacy_zero_speed_delay_keeps_historical_jitter(self):
         env = make_env()

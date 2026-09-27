@@ -767,6 +767,17 @@ class RacerEnv:
 
         if self.physics_enabled:
             base = self._base_vehicle_params
+            steering_profile = base.steering_profile
+            if steering_profile is not None and steering_profile.fast_diameter_range_m is not None:
+                fast_diameter = self._sample_range(steering_profile.fast_diameter_range_m)
+                mid_diameter = None
+                if steering_profile.mid_diameter_m is not None:
+                    mid_fraction = ((steering_profile.mid_diameter_m - steering_profile.slow_diameter_m)
+                                    / (steering_profile.fast_diameter_m - steering_profile.slow_diameter_m))
+                    mid_diameter = (steering_profile.slow_diameter_m
+                                    + mid_fraction * (fast_diameter - steering_profile.slow_diameter_m))
+                steering_profile = replace(steering_profile, fast_diameter_m=fast_diameter,
+                                           mid_diameter_m=mid_diameter)
             accel = max(0.0, base.acceleration * self._sample_range(self.phys_accel_scale))
             brake = max(0.0, base.brake_deceleration * self._sample_range(self.phys_brake_scale))
             reverse = max(0.0, base.reverse_acceleration * self._sample_range(self.phys_reverse_scale))
@@ -787,6 +798,7 @@ class RacerEnv:
                 drag=drag,
                 wheelbase=wheelbase,
                 max_steer_angle=max_steer,
+                steering_profile=steering_profile,
             )
         else:
             self.vehicle_params = self._base_vehicle_params

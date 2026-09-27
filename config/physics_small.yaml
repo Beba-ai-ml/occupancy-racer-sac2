@@ -22,7 +22,11 @@ vehicle:
     full_travel_s: 0.300
     # Full-lock turning-circle DIAMETERS, not radii. Approximate empirical fit.
     slow_diameter_m: 1.5
-    fast_diameter_m: 4.0
+    mid_speed_mps: 1.5
+    mid_diameter_m: 2.5
+    fast_diameter_m: 3.0
+    # Uniformly sampled once per episode; the 1.5 m/s point scales with it.
+    fast_diameter_range_m: [2.0, 3.0]
     reference_speed_mps: 2.0
     # Engineering starting range, not a measured distribution.
     timing_scale_range: [0.9, 1.1]

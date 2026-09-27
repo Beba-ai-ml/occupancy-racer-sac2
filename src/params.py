@@ -24,6 +24,12 @@ def build_vehicle_params(physics_cfg: dict) -> VehicleParams:
             fast_diameter_m=float(steering_cfg["fast_diameter_m"]),
             reference_speed_mps=float(steering_cfg["reference_speed_mps"]),
             timing_scale_range=tuple(float(v) for v in steering_cfg.get("timing_scale_range", [1.0, 1.0])),
+            mid_speed_mps=(float(steering_cfg["mid_speed_mps"])
+                           if "mid_speed_mps" in steering_cfg else None),
+            mid_diameter_m=(float(steering_cfg["mid_diameter_m"])
+                            if "mid_diameter_m" in steering_cfg else None),
+            fast_diameter_range_m=(tuple(float(v) for v in steering_cfg["fast_diameter_range_m"])
+                                   if "fast_diameter_range_m" in steering_cfg else None),
         )
 
     return VehicleParams(

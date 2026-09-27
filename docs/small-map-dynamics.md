@@ -1,8 +1,10 @@
 # Fizyka małych map - 26.09.2026
 
-Profil `config/config_sac_small.yaml` służy do nowych treningów rodziny J.
-Stare konfiguracje i checkpointy zachowują poprzednią fizykę. Profil dużej hali
-nie został jeszcze ustalony. Zmiana nie dotyka repozytorium ROS ani pojazdu.
+Profil `config/config_sac_small.yaml` służy do treningów małych map.
+Checkpoint zachowuje wagi, ale wznowiony trening używa pliku fizyki wskazanego
+przez aktualną konfigurację. Stare sesje zachowują poprzednią fizykę tylko wtedy,
+gdy wskazują jej niezmienioną kopię. Profil dużej hali nie został jeszcze ustalony.
+Zmiana nie dotyka repozytorium ROS ani pojazdu.
 
 ## Sterowanie i limity
 
@@ -34,15 +36,24 @@ maksimum 2 m/s, nie do losowanego ograniczenia. Limity nie dopisują nowego wej�
 
 ## Zakręty
 
-Użytkownik potwierdził, że 1,5 m przy wolnej jeździe i 4 m przy 2 m/s to
-**średnice**. Profil stosuje efektywną krzywą poszerzania zakrętu:
+27.09.2026 użytkownik skorygował średnice przy pełnym skręcie: 2,5 m przy
+1,5 m/s i 3 m przy 2 m/s. Punkt 1,5 m przy wolnej jeździe pozostał. Profil
+stosuje efektywną krzywą poszerzania zakrętu:
 
-`średnica(v) = 1,5 + (4 - 1,5) * (|v| / 2)^2`.
+`średnica(v) = 1,5 + (D2 - 1,5) * (|v| / 2)^p`, gdzie `D2` jest
+losowane z zakresu 2-3 m, a
+`p = log((2,5 - 1,5) / (3 - 1,5)) / log(1,5 / 2)`.
 
-Jest to przybliżenie z dwóch oszacowań, nie pełny model sił opony i bocznego
+Od 27.09.2026 trening losuje w każdym epizodzie średnicę przy 2 m/s
+jednostajnie z zakresu 2-3 m. Średnica przy 1,5 m/s skaluje się razem z nią
+od około 1,83 do 2,5 m, aby krzywa pozostała spójna. Czas reakcji serwa nie
+zmienia się przez to losowanie.
+
+Jest to przybliżenie z trzech oszacowań, nie pełny model sił opony i bocznego
 poślizgu. Punkt „wolno” nie ma zmierzonej prędkości, dlatego 1,5 m jest granicą
-przy prędkości bliskiej zeru. Przy 1 m/s średnica wynosi 2,125 m, przy 1,5 m/s
-2,906 m, przy 2 m/s 4 m. Częściowy skręt daje mniejszą krzywiznę; znaki
+przy prędkości bliskiej zeru. Dla górnego wariantu `D2=3` przy 1 m/s
+średnica wynosi około 2,065 m, przy 1,5 m/s 2,5 m, a przy 2 m/s 3 m.
+Częściowy skręt daje mniejszą krzywiznę; znaki
 skrętu pozostają bez zmian. Ten model zastępuje starą redukcję kąta i poślizg
 aktywowany dopiero powyżej 4 m/s, aby nie naliczać obu naraz.
 

@@ -13,6 +13,9 @@ class SteeringProfile:
     fast_diameter_m: float
     reference_speed_mps: float
     timing_scale_range: tuple[float, float] = (1.0, 1.0)
+    mid_speed_mps: float | None = None
+    mid_diameter_m: float | None = None
+    fast_diameter_range_m: tuple[float, float] | None = None
 
     def __post_init__(self) -> None:
         values = (self.full_travel_s, self.slow_diameter_m, self.fast_diameter_m,
@@ -23,6 +26,19 @@ class SteeringProfile:
             raise ValueError("Steering delay must be finite and nonnegative")
         if self.fast_diameter_m < self.slow_diameter_m:
             raise ValueError("Fast turning diameter must not be smaller than slow diameter")
+        if (self.mid_speed_mps is None) != (self.mid_diameter_m is None):
+            raise ValueError("Intermediate speed and diameter must be provided together")
+        if self.mid_speed_mps is not None:
+            if not (math.isfinite(self.mid_speed_mps) and 0 < self.mid_speed_mps < self.reference_speed_mps):
+                raise ValueError("Intermediate speed must be between zero and reference speed")
+            if not (math.isfinite(self.mid_diameter_m)
+                    and self.slow_diameter_m < self.mid_diameter_m < self.fast_diameter_m):
+                raise ValueError("Intermediate diameter must be between slow and fast diameters")
+        if self.fast_diameter_range_m is not None:
+            if (len(self.fast_diameter_range_m) != 2
+                    or any(not math.isfinite(v) for v in self.fast_diameter_range_m)
+                    or not self.slow_diameter_m < self.fast_diameter_range_m[0] <= self.fast_diameter_range_m[1]):
+                raise ValueError("Fast diameter range must be ordered and above slow diameter")
         if len(self.timing_scale_range) != 2 or self.timing_scale_range[0] > self.timing_scale_range[1]:
             raise ValueError("Timing scales must contain ordered min/max values")
 
@@ -30,8 +46,13 @@ class SteeringProfile:
         # Empirical understeer fit, not a tire-force model. Low-speed asymptote
         # and the diameter at reference_speed are user-supplied estimates.
         ratio = abs(speed_mps) / self.reference_speed_mps
+        exponent = 2.0
+        if self.mid_speed_mps is not None:
+            diameter_fraction = ((self.mid_diameter_m - self.slow_diameter_m)
+                                 / (self.fast_diameter_m - self.slow_diameter_m))
+            exponent = math.log(diameter_fraction) / math.log(self.mid_speed_mps / self.reference_speed_mps)
         return 0.5 * (self.slow_diameter_m
-                      + (self.fast_diameter_m - self.slow_diameter_m) * ratio * ratio)
+                      + (self.fast_diameter_m - self.slow_diameter_m) * ratio ** exponent)
 
 
 class SteeringActuator:
